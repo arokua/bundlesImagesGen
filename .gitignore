@@ -32,6 +32,11 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
+
+# local credentials
+service_account.json
+.tokens/
 
 # vercel
 .vercel
