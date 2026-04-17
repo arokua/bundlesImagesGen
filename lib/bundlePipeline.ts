@@ -19,6 +19,11 @@ import {
   getSkuNotesFor,
   type SkuNote,
 } from "@/lib/skuNotes";
+import {
+  fetchSkuDimensionsFor,
+  formatSkuDimensionsBlock,
+  type SkuDimension,
+} from "@/lib/skuDimensions";
 import type { ParsedBundle } from "@/lib/parseSkus";
 
 const MAX_IMAGES_PER_SKU_FOLDER = 8;
@@ -118,6 +123,8 @@ export type BundlePreviewPayload = {
   allSkus: string[];
   /** Per-SKU guidance that was sent to the model for this generation. */
   skuNotes: SkuNote[];
+  /** Per-SKU dimensions fetched from Woo store API and sent to the model. */
+  skuDimensions: SkuDimension[];
   /** Each matching Drive folder separately, with the images pulled from that folder. */
   referenceFolders: ReferenceFolderPreview[];
   /** Generated bundle lifestyle images (not yet on Drive). */
@@ -270,6 +277,8 @@ export async function generateBundlePreview(
     const lessonsBlock = await readLessonsBlock();
     const skuNotes = await getSkuNotesFor(skus);
     const skuNotesBlock = formatSkuNotesBlock(skuNotes);
+    const skuDimensions = await fetchSkuDimensionsFor(skus);
+    const skuDimensionsBlock = formatSkuDimensionsBlock(skuDimensions);
 
     const t = Date.now() + seedOffset * 97_171;
     const seeds = [
@@ -295,6 +304,7 @@ export async function generateBundlePreview(
         productCount: skus.length,
         lessonsBlock,
         skuNotesBlock,
+        skuDimensionsBlock,
       });
       generated.push(toPreviewPayload(g.mimeType, g.buffer));
     }
@@ -322,12 +332,17 @@ export async function generateBundlePreview(
         const singleNotesBlock = singleNote
           ? formatSkuNotesBlock([singleNote])
           : null;
+        const singleDim = skuDimensions.find((d) => d.sku === sku);
+        const singleDimensionsBlock = singleDim
+          ? formatSkuDimensionsBlock([singleDim])
+          : null;
         const iso = await generateIsolatedSingleImage({
           references: skuRefs,
           seed,
           sku,
           lessonsBlock,
           skuNotesBlock: singleNotesBlock,
+          skuDimensionsBlock: singleDimensionsBlock,
         });
         isolatedPerSku.push({
           sku,
@@ -351,6 +366,7 @@ export async function generateBundlePreview(
         productCount: skus.length,
         lessonsBlock,
         skuNotesBlock,
+        skuDimensionsBlock,
       });
       isolatedBundle = toPreviewPayload(iso.mimeType, iso.buffer);
     } catch (err) {
@@ -366,6 +382,7 @@ export async function generateBundlePreview(
         masterSku: bundle.master,
         allSkus: [...skus],
         skuNotes,
+        skuDimensions,
         referenceFolders,
         generated,
         isolatedPerSku,

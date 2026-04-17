@@ -42,6 +42,30 @@ type ReviewModalState = {
   seedOffset: number;
   preview: PreviewPayload;
   onChoose: (action: ReviewAction) => void;
+  uploadLabel?: string;
+  skipLabel?: string;
+};
+
+type ReviewQueueStatus =
+  | "queued"
+  | "generating"
+  | "ready"
+  | "approved"
+  | "skipped"
+  | "committing"
+  | "committed"
+  | "failed";
+
+type ReviewQueueItem = {
+  lineIndex: number;
+  bundleLabel: string;
+  bundleIndex: number;
+  bundleTotal: number;
+  seedOffset: number;
+  status: ReviewQueueStatus;
+  preview?: PreviewPayload;
+  error?: string;
+  commitResult?: BundleRow;
 };
 
 type ApiResult = {
@@ -71,6 +95,7 @@ export default function Home() {
   const [dedupeError, setDedupeError] = useState<string | null>(null);
 
   const [reviewModal, setReviewModal] = useState<ReviewModalState | null>(null);
+  const [reviewQueue, setReviewQueue] = useState<ReviewQueueItem[]>([]);
 
   const preview = useMemo(() => parseBundleInput(text), [text]);
 
@@ -91,6 +116,7 @@ export default function Home() {
     setStreamingResults([]);
     setDedupeError(null);
     setReviewModal(null);
+    setReviewQueue([]);
     try {
       const res = await fetch("/api/bundle", {
         method: "POST",
@@ -200,6 +226,7 @@ export default function Home() {
     setStreamingResults([]);
     setDedupeError(null);
     setReviewModal(null);
+    setReviewQueue([]);
 
     const results: BundleRow[] = [];
     let parseErrorsAcc: string[] | undefined;
@@ -336,6 +363,266 @@ export default function Home() {
     }
   }
 
+  function updateQueueItem(
+    lineIndex: number,
+    updater: (item: ReviewQueueItem) => ReviewQueueItem,
+  ) {
+    setReviewQueue((prev) =>
+      prev.map((item) => (item.lineIndex === lineIndex ? updater(item) : item)),
+    );
+  }
+
+  async function fetchBundlePreview(
+    lineIndex: number,
+    seedOffset: number,
+  ): Promise<
+    | { ok: true; preview: PreviewPayload; parseErrors?: string[] }
+    | { ok: false; lineIndex: number; error: string; parseErrors?: string[] }
+  > {
+    try {
+      const res = await fetch("/api/bundle/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text,
+          parentFolderId: parentFolderId || undefined,
+          lineIndex,
+          seedOffset,
+        }),
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        parseErrors?: string[];
+        preview?: PreviewPayload;
+        lineIndex?: number;
+      };
+      if (!res.ok || data.ok === false || !data.preview) {
+        return {
+          ok: false,
+          lineIndex: data.lineIndex ?? lineIndex,
+          error: data.error ?? "Preview failed.",
+          parseErrors: data.parseErrors,
+        };
+      }
+      return {
+        ok: true,
+        preview: data.preview,
+        parseErrors: data.parseErrors,
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        lineIndex,
+        error: e instanceof Error ? e.message : "Preview request failed.",
+      };
+    }
+  }
+
+  async function runPreviewQueue() {
+    const bundles = preview.bundles;
+    if (bundles.length === 0) return;
+
+    const queueInit: ReviewQueueItem[] = bundles.map((b, i) => ({
+      lineIndex: b.lineIndex,
+      bundleLabel: b.name?.trim() || `${b.master} + ${b.components.join(" ")}`,
+      bundleIndex: i,
+      bundleTotal: bundles.length,
+      seedOffset: 0,
+      status: "queued",
+    }));
+
+    setLoading(true);
+    setApiResult(null);
+    setStreamProgress(null);
+    setStreamingResults([]);
+    setDedupeError(null);
+    setReviewModal(null);
+    setReviewQueue(queueInit);
+
+    let parseErrorsAcc: string[] | undefined;
+    try {
+      for (let i = 0; i < queueInit.length; i++) {
+        const item = queueInit[i];
+        setStreamProgress({ current: i + 1, total: queueInit.length });
+        updateQueueItem(item.lineIndex, (it) => ({
+          ...it,
+          status: "generating",
+          error: undefined,
+        }));
+
+        const p = await fetchBundlePreview(item.lineIndex, item.seedOffset);
+        if (parseErrorsAcc === undefined && p.parseErrors?.length) {
+          parseErrorsAcc = p.parseErrors;
+        }
+
+        if (!p.ok) {
+          updateQueueItem(item.lineIndex, (it) => ({
+            ...it,
+            status: "failed",
+            error: p.error,
+          }));
+          continue;
+        }
+
+        updateQueueItem(item.lineIndex, (it) => ({
+          ...it,
+          status: "ready",
+          preview: p.preview,
+          error: undefined,
+        }));
+      }
+
+      setApiResult({
+        parseErrors: parseErrorsAcc,
+        bundlesParsed: queueInit.length,
+      });
+    } finally {
+      setLoading(false);
+      setStreamProgress(null);
+    }
+  }
+
+  async function regenerateQueuePreview(item: ReviewQueueItem) {
+    const nextSeed = item.seedOffset + 1;
+    setLoading(true);
+    updateQueueItem(item.lineIndex, (it) => ({
+      ...it,
+      status: "generating",
+      seedOffset: nextSeed,
+      error: undefined,
+    }));
+    try {
+      const p = await fetchBundlePreview(item.lineIndex, nextSeed);
+      if (!p.ok) {
+        updateQueueItem(item.lineIndex, (it) => ({
+          ...it,
+          status: "failed",
+          error: p.error,
+        }));
+        return;
+      }
+      updateQueueItem(item.lineIndex, (it) => ({
+        ...it,
+        status: "ready",
+        preview: p.preview,
+        error: undefined,
+      }));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function openQueueReview(item: ReviewQueueItem) {
+    if (!item.preview) return;
+    setReviewModal({
+      bundleLabel: item.bundleLabel,
+      bundleIndex: item.bundleIndex,
+      bundleTotal: item.bundleTotal,
+      seedOffset: item.seedOffset,
+      preview: item.preview,
+      uploadLabel: "Approve for batch commit",
+      skipLabel: "Mark as skipped",
+      onChoose: (action) => {
+        setReviewModal(null);
+        if (action === "upload") {
+          updateQueueItem(item.lineIndex, (it) => ({
+            ...it,
+            status: "approved",
+            error: undefined,
+          }));
+          return;
+        }
+        if (action === "skip") {
+          updateQueueItem(item.lineIndex, (it) => ({
+            ...it,
+            status: "skipped",
+          }));
+          return;
+        }
+        void regenerateQueuePreview(item);
+      },
+    });
+  }
+
+  async function commitApprovedQueue() {
+    const targets = reviewQueue.filter(
+      (it) => it.status === "approved" && it.preview,
+    );
+    if (targets.length === 0) {
+      setApiResult({ error: "No approved previews to commit." });
+      return;
+    }
+
+    setLoading(true);
+    setApiResult(null);
+    setStreamProgress(null);
+
+    const results: BundleRow[] = [];
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        const item = targets[i];
+        if (!item.preview) continue;
+        setStreamProgress({ current: i + 1, total: targets.length });
+        updateQueueItem(item.lineIndex, (it) => ({ ...it, status: "committing" }));
+
+        const commitRes = await fetch("/api/bundle/commit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            outputFolderId: outputFolderId || undefined,
+            lineIndex: item.lineIndex,
+            folderName: item.preview.folderName,
+            masterSku: item.preview.masterSku,
+            generated: item.preview.generated,
+            isolatedPerSku: item.preview.isolatedPerSku,
+            isolatedBundle: item.preview.isolatedBundle,
+          }),
+        });
+
+        const commitJson = (await commitRes.json()) as {
+          ok?: boolean;
+          error?: string;
+          result?: BundleRow;
+        };
+        const cr = commitJson.result;
+        if (cr?.ok) {
+          results.push(cr);
+          updateQueueItem(item.lineIndex, (it) => ({
+            ...it,
+            status: "committed",
+            commitResult: cr,
+            error: undefined,
+          }));
+        } else {
+          const err =
+            cr && !cr.ok ? cr.error : commitJson.error ?? "Commit failed.";
+          const row: BundleRow = {
+            lineIndex: item.lineIndex,
+            ok: false,
+            error: err,
+          };
+          results.push(row);
+          updateQueueItem(item.lineIndex, (it) => ({
+            ...it,
+            status: "failed",
+            error: err,
+            commitResult: row,
+          }));
+        }
+        setStreamingResults([...results]);
+      }
+
+      setApiResult({
+        results,
+        bundlesParsed: targets.length,
+      });
+    } finally {
+      setLoading(false);
+      setStreamProgress(null);
+    }
+  }
+
   async function runDedupe() {
     setDedupeLoading(true);
     setDedupeInfo(null);
@@ -367,6 +654,10 @@ export default function Home() {
   }
 
   const displayResults = apiResult?.results ?? streamingResults;
+  const approvedCount = reviewQueue.filter((q) => q.status === "approved").length;
+  const committedCount = reviewQueue.filter(
+    (q) => q.status === "committed",
+  ).length;
 
   return (
     <div className="min-h-full bg-zinc-100 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-50">
@@ -496,7 +787,23 @@ export default function Home() {
             disabled={loading || preview.bundles.length === 0}
             className="rounded-full bg-zinc-900 px-5 py-2.5 text-sm font-medium text-white shadow hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white"
           >
-            {loading ? "Running…" : "Generate bundles (preview)"}
+            {loading ? "Running…" : "Generate bundles (preview, popup mode)"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void runPreviewQueue()}
+            disabled={loading || preview.bundles.length === 0}
+            className="rounded-full border border-emerald-600 bg-emerald-50 px-4 py-2 text-sm font-medium text-emerald-900 hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-emerald-950 dark:text-emerald-100 dark:hover:bg-emerald-900"
+          >
+            {loading ? "…" : "Generate previews queue (no popup)"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void commitApprovedQueue()}
+            disabled={loading || approvedCount === 0}
+            className="rounded-full border border-emerald-700 bg-white px-4 py-2 text-sm font-medium text-emerald-800 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-500 dark:bg-zinc-900 dark:text-emerald-300 dark:hover:bg-zinc-800"
+          >
+            {loading ? "…" : `Commit approved only (${approvedCount})`}
           </button>
           <button
             type="button"
@@ -567,6 +874,98 @@ export default function Home() {
               <li key={`${i}-${e}`}>{e}</li>
             ))}
           </ul>
+        )}
+
+        {reviewQueue.length > 0 && (
+          <section className="space-y-3 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-sm font-medium">Review queue</h2>
+              <p className="text-xs text-zinc-500">
+                {approvedCount} approved · {committedCount} committed ·{" "}
+                {
+                  reviewQueue.filter((q) => q.status === "failed" || q.status === "skipped")
+                    .length
+                }{" "}
+                skipped/failed
+              </p>
+            </div>
+            <p className="text-xs text-zinc-500">
+              This mode generates previews first (no popup). You can open any item,
+              approve or skip selectively, then click{" "}
+              <strong>Commit approved only</strong>.
+            </p>
+            <ul className="space-y-2 text-sm">
+              {reviewQueue.map((item) => (
+                <li
+                  key={item.lineIndex}
+                  className="rounded border border-zinc-200 p-3 dark:border-zinc-700"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <p className="font-medium text-zinc-800 dark:text-zinc-200">
+                        {item.bundleIndex + 1}. {item.bundleLabel}
+                      </p>
+                      <p className="font-mono text-[11px] text-zinc-500">
+                        line {item.lineIndex + 1} · seedOffset {item.seedOffset}
+                      </p>
+                    </div>
+                    <span className="rounded-full border border-zinc-300 px-2 py-0.5 text-[11px] font-medium capitalize text-zinc-700 dark:border-zinc-600 dark:text-zinc-300">
+                      {item.status}
+                    </span>
+                  </div>
+                  {item.error && (
+                    <p className="mt-2 text-xs text-red-700 dark:text-red-400">
+                      {item.error}
+                    </p>
+                  )}
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      className="rounded-full border border-zinc-300 px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                      onClick={() => openQueueReview(item)}
+                      disabled={!item.preview}
+                    >
+                      Open preview
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-full border border-amber-400 bg-amber-50 px-3 py-1 text-xs font-medium text-amber-900 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-amber-950 dark:text-amber-100"
+                      onClick={() => void regenerateQueuePreview(item)}
+                      disabled={loading}
+                    >
+                      Regenerate
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-full border border-emerald-500 bg-emerald-50 px-3 py-1 text-xs font-medium text-emerald-900 hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-emerald-950 dark:text-emerald-100"
+                      onClick={() =>
+                        updateQueueItem(item.lineIndex, (it) => ({
+                          ...it,
+                          status: "approved",
+                        }))
+                      }
+                      disabled={!item.preview || loading}
+                    >
+                      Approve
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-full border border-zinc-300 px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                      onClick={() =>
+                        updateQueueItem(item.lineIndex, (it) => ({
+                          ...it,
+                          status: "skipped",
+                        }))
+                      }
+                      disabled={loading}
+                    >
+                      Skip
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </section>
         )}
 
         {displayResults.length > 0 && (
@@ -982,7 +1381,7 @@ function ReviewModal({ state }: { state: ReviewModalState }) {
             className="rounded-full bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
             onClick={() => void handleChoice("upload")}
           >
-            Yes — upload to Drive
+            {state.uploadLabel ?? "Yes — upload to Drive"}
           </button>
           <button
             type="button"
@@ -996,7 +1395,7 @@ function ReviewModal({ state }: { state: ReviewModalState }) {
             className="rounded-full border border-zinc-300 px-4 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800"
             onClick={() => void handleChoice("skip")}
           >
-            Skip this bundle
+            {state.skipLabel ?? "Skip this bundle"}
           </button>
         </div>
       </div>
