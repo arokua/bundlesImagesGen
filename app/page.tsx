@@ -972,6 +972,15 @@ export default function Home() {
             Pulls product photos from Google Drive, creates new bundle images with AI,
             and saves them where you choose. Follow the numbered steps.
           </p>
+          <p className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+            <span className="font-semibold text-zinc-900 dark:text-zinc-100">
+              Plan time:
+            </span>{" "}
+            Loading photos, AI image creation, and saving back to Drive can take{" "}
+            <span className="font-medium">several minutes per bundle</span> — and
+            longer for many products or large batches. Don&apos;t close the tab;
+            wait for progress to finish.
+          </p>
         </header>
 
         <section
@@ -1004,8 +1013,9 @@ export default function Home() {
                   Connect Google Drive
                 </p>
                 <p className="mt-0.5 text-zinc-600 dark:text-zinc-400">
-                  Paste the two folder codes (photo source and where to save results).
-                  First time only: use the link below to allow access.
+                  Authorize Drive first (big blue button in step 2). Then paste the two
+                  folder codes. This can take a while — see &quot;Plan time&quot; at
+                  the top.
                 </p>
               </div>
             </li>
@@ -1034,7 +1044,8 @@ export default function Home() {
                 </p>
                 <p className="mt-0.5 text-zinc-600 dark:text-zinc-400">
                   You will pick photos first, then review AI images, then save to
-                  Drive when happy.
+                  Drive when happy. Expect waits while the app talks to Drive and
+                  creates images — often several minutes per bundle.
                 </p>
               </div>
             </li>
@@ -1083,19 +1094,29 @@ export default function Home() {
         </section>
 
         <section className="grid gap-4 sm:grid-cols-2">
+          <div className="sm:col-span-2 rounded-xl border-2 border-amber-400 bg-gradient-to-b from-amber-50 to-amber-100/80 p-5 shadow-lg dark:border-amber-500 dark:from-amber-950/80 dark:to-amber-950/40">
+            <p className="text-base font-bold tracking-tight text-amber-950 dark:text-amber-50">
+              Step 2 — Authorize Google Drive first (required)
+            </p>
+            <p className="mt-2 text-sm leading-snug text-amber-950/90 dark:text-amber-100/90">
+              The app cannot read your product photos or save finished images until you
+              sign in and allow access. Use the Google account that owns these
+              folders. You may only need to do this once per browser.
+            </p>
+            <a
+              href="/api/auth/google"
+              className="mt-4 flex w-full items-center justify-center rounded-xl bg-[#1a73e8] px-6 py-4 text-center text-base font-bold text-white shadow-xl shadow-blue-600/35 ring-4 ring-blue-400/40 transition hover:bg-[#1557b0] hover:shadow-blue-700/40 hover:ring-blue-300/60 focus:outline-none focus-visible:ring-4 focus-visible:ring-amber-200 active:scale-[0.99] sm:inline-flex sm:w-auto"
+            >
+              Authorize Google Drive
+            </a>
+          </div>
           <div className="sm:col-span-2">
             <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
               2. Google Drive folders
             </h2>
             <p className="mt-0.5 text-xs text-zinc-500">
-              Open each folder in Google Drive and copy the long ID from the browser
-              address bar.{" "}
-              <a
-                className="font-medium text-emerald-700 underline hover:text-emerald-900 dark:text-emerald-400"
-                href="/api/auth/google"
-              >
-                First time: connect Google Drive
-              </a>
+              After authorizing, open each folder in Google Drive and copy the long ID
+              from the browser address bar into the boxes below.
             </p>
           </div>
           <div className="space-y-1">
@@ -1322,7 +1343,13 @@ export default function Home() {
           <p className="mt-2 max-w-xl text-sm leading-relaxed text-zinc-300">
             First you&apos;ll choose which product photos to use. Then the app creates
             new images. You approve before anything is saved to your &quot;finished
-            images&quot; folder.
+            images&quot; folder.{" "}
+            <span className="font-medium text-amber-200/95">
+              This process is not instant
+            </span>
+            — loading references and generating each set of images can take several
+            minutes; large queues take longer. Keep this tab open until each step
+            finishes.
           </p>
           <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:flex-wrap">
             <button
@@ -1391,6 +1418,9 @@ export default function Home() {
 
         {streamProgress && streamProgress.total > 0 && (
           <div className="space-y-1">
+            <p className="text-xs text-zinc-500">
+              Working — this can take several minutes. Please wait.
+            </p>
             <div className="flex justify-between text-xs text-zinc-600 dark:text-zinc-400">
               <span>Progress</span>
               <span>
