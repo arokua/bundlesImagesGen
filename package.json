@@ -6,10 +6,13 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "apphosting:env": "node scripts/env-to-apphosting.mjs",
+    "apphosting:env:local": "node scripts/env-to-apphosting.mjs --file .env.local --secrets GEMINI_API_KEY,GOOGLE_OAUTH_CLIENT_SECRET,GOOGLE_OAUTH_CLIENT_ID"
   },
   "dependencies": {
     "@google/genai": "^1.50.1",
+    "firebase": "^12.12.0",
     "google-auth-library": "^10.6.2",
     "googleapis": "^171.4.0",
     "next": "16.2.3",

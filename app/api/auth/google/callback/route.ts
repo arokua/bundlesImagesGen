@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { getOAuth2ClientForRedirect } from "@/lib/driveAuth";
+import {
+  getOAuth2ClientForRedirect,
+  resolveOAuthRedirectUri,
+  resolvePublicSiteOrigin,
+} from "@/lib/driveAuth";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -15,7 +19,8 @@ export async function GET(request: Request) {
   }
 
   try {
-    const oauth2 = getOAuth2ClientForRedirect();
+    const redirectUri = resolveOAuthRedirectUri(request);
+    const oauth2 = getOAuth2ClientForRedirect(redirectUri);
     const { tokens } = await oauth2.getToken(code);
     oauth2.setCredentials(tokens);
     const tokenPath =
@@ -27,7 +32,8 @@ export async function GET(request: Request) {
       );
     await fs.mkdir(path.dirname(tokenPath), { recursive: true });
     await fs.writeFile(tokenPath, JSON.stringify(tokens, null, 2), "utf8");
-    return NextResponse.redirect(new URL("/", request.url));
+    const site = resolvePublicSiteOrigin(request).replace(/\/+$/, "");
+    return NextResponse.redirect(`${site}/`);
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Token exchange failed.";
     return NextResponse.json({ error: msg }, { status: 500 });

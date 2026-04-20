@@ -1,5 +1,6 @@
 import type { drive_v3 } from "googleapis";
 import {
+  copyDriveFileToFolder,
   createSubfolder,
   downloadFileBuffer,
   listImageFilesInFolder,
@@ -12,8 +13,8 @@ import {
   generateBundleImage,
   generateIsolatedBundleImage,
   generateIsolatedSingleImage,
-  readLessonsBlock,
 } from "@/lib/generateImages";
+import { readImagePromptExtras } from "@/lib/promptContext";
 import {
   formatSkuNotesBlock,
   getSkuNotesFor,
@@ -25,65 +26,43 @@ import {
   type SkuDimension,
 } from "@/lib/skuDimensions";
 import type { ParsedBundle } from "@/lib/parseSkus";
-
-const MAX_IMAGES_PER_SKU_FOLDER = 8;
-
-/** When several Drive folders match one SKU, take this many images from each (merged in name order). */
-function imagesPerFolderWhenMultipleMatches(): number {
-  const n = Number.parseInt(
-    process.env.BUNDLE_IMAGES_PER_DUPLICATE_SKU_FOLDER ?? "2",
-    10,
-  );
-  return Number.isFinite(n) && n >= 1 ? Math.min(8, n) : 2;
-}
+import { driveFileUrl, driveFolderUrl } from "@/lib/driveLinks";
 
 type RefImage = { mimeType: string; data: Buffer };
 
-function pickReferencesCapped(
+/** Natural refs only (one per Drive folder), in master + component order. */
+function flattenNaturalRefs(
+  skuOrder: string[],
   bySku: Map<string, RefImage[]>,
-  master: string,
-  components: string[],
+): RefImage[] {
+  const out: RefImage[] = [];
+  for (const sku of skuOrder) {
+    const list = bySku.get(sku) ?? [];
+    for (const r of list) out.push(r);
+  }
+  return out;
+}
+
+/**
+ * Lifestyle bundle refs: for each SKU, all natural folder picks for that SKU, then that SKU’s blank-background image.
+ * Capped to maxRef (drops trailing items if over).
+ */
+function buildBundleLifestyleReferences(
+  skuOrder: string[],
+  bySku: Map<string, RefImage[]>,
+  isolatedBySku: Map<string, RefImage>,
   maxRef: number,
 ): RefImage[] {
-  if (maxRef < 1) {
-    throw new Error("GEMINI_MAX_REFERENCE_IMAGES must be at least 1.");
-  }
-
-  const skuOrder = [master, ...components];
-  const minNeeded = skuOrder.length;
-
-  if (maxRef < minNeeded) {
-    throw new Error(
-      `GEMINI_MAX_REFERENCE_IMAGES (${maxRef}) must be at least ${minNeeded} (one reference per product: master + ${components.length} component(s)).`,
-    );
-  }
-
-  for (const sku of skuOrder) {
-    const list = bySku.get(sku);
-    if (!list?.length) {
-      throw new Error(`No reference images collected for SKU "${sku}".`);
-    }
-  }
-
-  const nextIndex = new Map<string, number>();
-  for (const sku of skuOrder) nextIndex.set(sku, 0);
-
   const out: RefImage[] = [];
-  while (out.length < maxRef) {
-    let progressed = false;
-    for (const sku of skuOrder) {
-      if (out.length >= maxRef) break;
-      const list = bySku.get(sku)!;
-      const i = nextIndex.get(sku)!;
-      if (i < list.length) {
-        out.push(list[i]);
-        nextIndex.set(sku, i + 1);
-        progressed = true;
-      }
+  for (const sku of skuOrder) {
+    const naturals = bySku.get(sku) ?? [];
+    for (const r of naturals) {
+      if (out.length >= maxRef) return out;
+      out.push(r);
     }
-    if (!progressed) break;
+    const iso = isolatedBySku.get(sku);
+    if (iso && out.length < maxRef) out.push(iso);
   }
-
   return out;
 }
 
@@ -93,7 +72,9 @@ export type BundleResult =
       ok: true;
       folderName: string;
       outputFolderId: string;
+      folderUrl: string;
       fileIds: string[];
+      fileUrls: string[];
     }
   | { lineIndex: number; ok: false; error: string };
 
@@ -115,6 +96,14 @@ export type IsolatedSkuPreview = {
   image: PreviewImagePayload;
 };
 
+/** Selected reference file in Drive (one per matched folder) — used to copy originals into the bundle output folder on commit. */
+export type ReferenceSourceCopy = {
+  fileId: string;
+  /** Original filename in the source folder */
+  name: string;
+  sku: string;
+};
+
 export type BundlePreviewPayload = {
   lineIndex: number;
   folderName: string;
@@ -127,6 +116,8 @@ export type BundlePreviewPayload = {
   skuDimensions: SkuDimension[];
   /** Each matching Drive folder separately, with the images pulled from that folder. */
   referenceFolders: ReferenceFolderPreview[];
+  /** Drive file id + name for each chosen reference (copied into output on commit). */
+  referenceSourceFiles: ReferenceSourceCopy[];
   /** Generated bundle lifestyle images (not yet on Drive). */
   generated: PreviewImagePayload[];
   /** Blank-background isolated image per product SKU (master + components). */
@@ -144,19 +135,23 @@ type FolderRefSource = {
   images: RefImage[];
 };
 
+const MAX_PREVIEW_IMAGES_PER_FOLDER = 12;
+
 async function collectRefImagesBySku(
   drive: drive_v3.Drive,
   bundle: ParsedBundle,
   primaryChildFolders: ChildFolder[],
   fallbackChildFolders: ChildFolder[] | null,
+  refSelection?: Record<string, number>,
 ): Promise<{
   bySku: Map<string, RefImage[]>;
   folderSources: FolderRefSource[];
+  referenceSourceFiles: ReferenceSourceCopy[];
 }> {
   const skus = [bundle.master, ...bundle.components];
   const bySku = new Map<string, RefImage[]>();
   const folderSources: FolderRefSource[] = [];
-  const multiCap = imagesPerFolderWhenMultipleMatches();
+  const referenceSourceFiles: ReferenceSourceCopy[] = [];
   for (const sku of skus) {
     let folders = resolveAllFoldersForSku(
       primaryChildFolders,
@@ -166,8 +161,6 @@ async function collectRefImagesBySku(
     folders = [...folders].sort((a, b) =>
       a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
     );
-    const perFolderLimit =
-      folders.length > 1 ? multiCap : MAX_IMAGES_PER_SKU_FOLDER;
     const list: RefImage[] = [];
     for (const folder of folders) {
       const folderId = folder.id;
@@ -175,7 +168,7 @@ async function collectRefImagesBySku(
         throw new Error(`Missing id for folder "${sku}".`);
       }
       const images = await listImageFilesInFolder(drive, folderId);
-      const slice = images.slice(0, perFolderLimit);
+      const slice = images.slice(0, MAX_PREVIEW_IMAGES_PER_FOLDER);
       if (slice.length === 0) {
         if (folders.length > 1) continue;
         throw new Error(
@@ -186,25 +179,40 @@ async function collectRefImagesBySku(
       for (const img of slice) {
         if (!img.id || !img.mimeType) continue;
         const data = await downloadFileBuffer(drive, img.id);
-        const ref = { mimeType: img.mimeType, data };
-        fromThisFolder.push(ref);
-        list.push(ref);
+        fromThisFolder.push({ mimeType: img.mimeType, data });
       }
-      if (fromThisFolder.length > 0) {
-        folderSources.push({
+      if (fromThisFolder.length === 0) {
+        if (folders.length > 1) continue;
+        throw new Error(
+          `No downloadable image files in folder "${folder.name}" for SKU "${sku}".`,
+        );
+      }
+      const pick = Math.min(
+        Math.max(0, refSelection?.[folderId] ?? 0),
+        fromThisFolder.length - 1,
+      );
+      list.push(fromThisFolder[pick]!);
+      const pickedMeta = slice[pick];
+      if (pickedMeta?.id) {
+        referenceSourceFiles.push({
+          fileId: pickedMeta.id,
+          name: pickedMeta.name ?? `image-${pick}`,
           sku,
-          folderId,
-          folderName: folder.name,
-          images: fromThisFolder,
         });
       }
+      folderSources.push({
+        sku,
+        folderId,
+        folderName: folder.name,
+        images: fromThisFolder,
+      });
     }
     if (list.length === 0) {
       throw new Error(`No downloadable image files in folders for SKU "${sku}".`);
     }
     bySku.set(sku, list);
   }
-  return { bySku, folderSources };
+  return { bySku, folderSources, referenceSourceFiles };
 }
 
 function toPreviewPayload(
@@ -217,8 +225,71 @@ function toPreviewPayload(
   };
 }
 
+/** Drive refs + notes only — no Gemini (used before user confirms AI generation). */
+export type BundleRefsOnlyPayload = {
+  lineIndex: number;
+  folderName: string;
+  masterSku: string;
+  allSkus: string[];
+  skuNotes: SkuNote[];
+  skuDimensions: SkuDimension[];
+  referenceFolders: ReferenceFolderPreview[];
+  referenceSourceFiles: ReferenceSourceCopy[];
+};
+
+export async function collectBundleRefsOnly(
+  drive: drive_v3.Drive,
+  bundle: ParsedBundle,
+  primaryChildFolders: ChildFolder[],
+  fallbackChildFolders: ChildFolder[] | null,
+  refSelection?: Record<string, number>,
+): Promise<
+  | { ok: true; previewRefs: BundleRefsOnlyPayload }
+  | { ok: false; lineIndex: number; error: string }
+> {
+  const skus = [bundle.master, ...bundle.components];
+  const lineIndex = bundle.lineIndex;
+  try {
+    const { folderSources, referenceSourceFiles } =
+      await collectRefImagesBySku(
+        drive,
+        bundle,
+        primaryChildFolders,
+        fallbackChildFolders,
+        refSelection,
+      );
+    const folderName = driveFolderName(bundle, skus);
+    const referenceFolders: BundlePreviewPayload["referenceFolders"] =
+      folderSources.map((fs) => ({
+        sku: fs.sku,
+        folderId: fs.folderId,
+        folderName: fs.folderName,
+        images: fs.images.map((r) => toPreviewPayload(r.mimeType, r.data)),
+      }));
+    const skuNotes = await getSkuNotesFor(skus);
+    const skuDimensions = await fetchSkuDimensionsFor(skus);
+    return {
+      ok: true,
+      previewRefs: {
+        lineIndex,
+        folderName,
+        masterSku: bundle.master,
+        allSkus: [...skus],
+        skuNotes,
+        skuDimensions,
+        referenceFolders,
+        referenceSourceFiles,
+      },
+    };
+  } catch (e) {
+    const err = e instanceof Error ? e.message : String(e);
+    return { ok: false, lineIndex, error: err };
+  }
+}
+
 /**
  * Build reference thumbnails per SKU (for UI) + run Gemini. Does not touch Drive output.
+ * Per-SKU blank backgrounds are generated first, then lifestyle shots use natural refs plus those studio images.
  */
 export async function generateBundlePreview(
   drive: drive_v3.Drive,
@@ -226,19 +297,23 @@ export async function generateBundlePreview(
   primaryChildFolders: ChildFolder[],
   fallbackChildFolders: ChildFolder[] | null,
   seedOffset: number,
+  refSelection?: Record<string, number>,
 ): Promise<
   | { ok: true; preview: BundlePreviewPayload }
   | { ok: false; lineIndex: number; error: string }
 > {
   const skus = [bundle.master, ...bundle.components];
+  const skuOrder = [bundle.master, ...bundle.components];
   const lineIndex = bundle.lineIndex;
   try {
-    const { bySku, folderSources } = await collectRefImagesBySku(
-      drive,
-      bundle,
-      primaryChildFolders,
-      fallbackChildFolders,
-    );
+    const { bySku, folderSources, referenceSourceFiles } =
+      await collectRefImagesBySku(
+        drive,
+        bundle,
+        primaryChildFolders,
+        fallbackChildFolders,
+        refSelection,
+      );
 
     const folderName = driveFolderName(bundle, skus);
 
@@ -254,12 +329,6 @@ export async function generateBundlePreview(
       1,
       Number.parseInt(process.env.GEMINI_MAX_REFERENCE_IMAGES ?? "12", 10) || 12,
     );
-    const cappedRefs = pickReferencesCapped(
-      bySku,
-      bundle.master,
-      bundle.components,
-      maxRef,
-    );
 
     const imagesPerBundle = Math.min(
       2,
@@ -274,7 +343,16 @@ export async function generateBundlePreview(
         800,
     );
 
-    const lessonsBlock = await readLessonsBlock();
+    const {
+      lessonsBlock,
+      globalRulesBlock,
+      lifestylePromptPrefixMulti,
+      lifestylePromptPrefixSingle,
+    } = await readImagePromptExtras(bundle.master);
+    const lifestylePromptPrefixOverride =
+      skus.length > 1
+        ? lifestylePromptPrefixMulti
+        : lifestylePromptPrefixSingle;
     const skuNotes = await getSkuNotesFor(skus);
     const skuNotesBlock = formatSkuNotesBlock(skuNotes);
     const skuDimensions = await fetchSkuDimensionsFor(skus);
@@ -289,33 +367,17 @@ export async function generateBundlePreview(
       "primary composition",
       "alternate angle and styling",
     ] as const;
-    const generated: PreviewImagePayload[] = [];
-
-    for (let i = 0; i < imagesPerBundle; i++) {
-      if (i > 0 && gapMs > 0) {
-        await new Promise((r) => setTimeout(r, gapMs));
-      }
-      const g = await generateBundleImage({
-        references: cappedRefs,
-        seed: seeds[i],
-        variationLabel: labels[i],
-        bundleName: bundle.name,
-        bundleDescription: bundle.description,
-        productCount: skus.length,
-        lessonsBlock,
-        skuNotesBlock,
-        skuDimensionsBlock,
-      });
-      generated.push(toPreviewPayload(g.mimeType, g.buffer));
-    }
 
     const isolationWarnings: string[] = [];
     const isolatedPerSku: IsolatedSkuPreview[] = [];
+    const isolatedBySku = new Map<string, RefImage>();
+
     const isoMaxRefPerSku = Math.max(
       1,
       Number.parseInt(process.env.GEMINI_ISOLATED_MAX_REFS_PER_SKU ?? "4", 10) ||
         4,
     );
+
     for (let i = 0; i < skus.length; i++) {
       const sku = skus[i];
       if (gapMs > 0) {
@@ -343,35 +405,79 @@ export async function generateBundlePreview(
           lessonsBlock,
           skuNotesBlock: singleNotesBlock,
           skuDimensionsBlock: singleDimensionsBlock,
+          globalRulesBlock,
         });
         isolatedPerSku.push({
           sku,
           image: toPreviewPayload(iso.mimeType, iso.buffer),
         });
+        isolatedBySku.set(sku, { mimeType: iso.mimeType, data: iso.buffer });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         isolationWarnings.push(`Isolated ${sku} failed: ${msg}`);
       }
     }
 
-    let isolatedBundle: PreviewImagePayload | null = null;
-    try {
-      if (gapMs > 0) {
+    const bundleLifestyleRefs = buildBundleLifestyleReferences(
+      skuOrder,
+      bySku,
+      isolatedBySku,
+      maxRef,
+    );
+    if (bundleLifestyleRefs.length === 0) {
+      throw new Error(
+        "No reference images for bundle lifestyle generation (increase GEMINI_MAX_REFERENCE_IMAGES or fix isolation failures).",
+      );
+    }
+
+    const generated: PreviewImagePayload[] = [];
+    for (let i = 0; i < imagesPerBundle; i++) {
+      if (i > 0 && gapMs > 0) {
         await new Promise((r) => setTimeout(r, gapMs));
       }
-      const seed = (t % 900000) + 24691 + seedOffset * 11;
-      const iso = await generateIsolatedBundleImage({
-        references: cappedRefs,
-        seed,
+      const g = await generateBundleImage({
+        references: bundleLifestyleRefs,
+        seed: seeds[i],
+        variationLabel: labels[i],
+        bundleName: bundle.name,
+        bundleDescription: bundle.description,
         productCount: skus.length,
         lessonsBlock,
         skuNotesBlock,
         skuDimensionsBlock,
+        globalRulesBlock,
+        lifestylePromptPrefixOverride:
+          lifestylePromptPrefixOverride?.trim() || null,
       });
-      isolatedBundle = toPreviewPayload(iso.mimeType, iso.buffer);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      isolationWarnings.push(`Isolated bundle failed: ${msg}`);
+      generated.push(toPreviewPayload(g.mimeType, g.buffer));
+    }
+
+    const naturalFlat = flattenNaturalRefs(skuOrder, bySku);
+    const isoBundleRefs = naturalFlat.slice(0, maxRef);
+
+    let isolatedBundle: PreviewImagePayload | null = null;
+    if (isoBundleRefs.length === 0) {
+      isolationWarnings.push("No natural refs for isolated bundle lineup.");
+    } else {
+      try {
+        if (gapMs > 0) {
+          await new Promise((r) => setTimeout(r, gapMs));
+        }
+        const seed = (t % 900000) + 24691 + seedOffset * 11;
+        const iso = await generateIsolatedBundleImage({
+          references: isoBundleRefs,
+          seed,
+          productCount: skus.length,
+          lessonsBlock,
+          skuNotesBlock,
+          skuDimensionsBlock,
+          globalRulesBlock,
+        });
+        isolatedBundle = toPreviewPayload(iso.mimeType, iso.buffer);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        isolationWarnings.push(`Isolated bundle failed: ${msg}`);
+      }
     }
 
     return {
@@ -384,6 +490,7 @@ export async function generateBundlePreview(
         skuNotes,
         skuDimensions,
         referenceFolders,
+        referenceSourceFiles,
         generated,
         isolatedPerSku,
         isolatedBundle,
@@ -394,6 +501,10 @@ export async function generateBundlePreview(
     const err = e instanceof Error ? e.message : String(e);
     return { ok: false, lineIndex, error: err };
   }
+}
+
+function safeDriveFileName(name: string): string {
+  return name.replace(/[/\\?%*:|"<>]/g, "_").trim() || "ref";
 }
 
 function extFor(mimeType: string): string {
@@ -431,6 +542,7 @@ export async function commitBundleToDrive(
   generated: PreviewImagePayload[],
   isolatedPerSku: IsolatedSkuPreview[] = [],
   isolatedBundle: PreviewImagePayload | null = null,
+  referenceSourceFiles: ReferenceSourceCopy[] = [],
 ): Promise<BundleResult> {
   try {
     const bundleFolderId = await createSubfolder(
@@ -440,38 +552,56 @@ export async function commitBundleToDrive(
     );
 
     const fileIds: string[] = [];
-    for (let i = 0; i < generated.length; i++) {
-      fileIds.push(
-        await uploadPreviewImage(
-          drive,
-          `${masterSku}_${i + 1}`,
-          generated[i],
-          bundleFolderId,
-        ),
+    const fileUrls: string[] = [];
+
+    let refCopyIndex = 0;
+    for (const ref of referenceSourceFiles) {
+      if (!ref?.fileId?.trim()) continue;
+      const base = safeDriveFileName(ref.name);
+      const copyName = `ref_${ref.sku}_${refCopyIndex}_${base}`;
+      refCopyIndex += 1;
+      const id = await copyDriveFileToFolder(
+        drive,
+        ref.fileId.trim(),
+        copyName,
+        bundleFolderId,
       );
+      fileIds.push(id);
+      fileUrls.push(driveFileUrl(id));
+    }
+
+    for (let i = 0; i < generated.length; i++) {
+      const id = await uploadPreviewImage(
+        drive,
+        `${masterSku}_${i + 1}`,
+        generated[i],
+        bundleFolderId,
+      );
+      fileIds.push(id);
+      fileUrls.push(driveFileUrl(id));
+    }
+
+    if (isolatedBundle) {
+      const id = await uploadPreviewImage(
+        drive,
+        `${masterSku}_bundle_iso`,
+        isolatedBundle,
+        bundleFolderId,
+      );
+      fileIds.push(id);
+      fileUrls.push(driveFileUrl(id));
     }
 
     for (const iso of isolatedPerSku) {
       if (!iso?.sku) continue;
-      fileIds.push(
-        await uploadPreviewImage(
-          drive,
-          `${iso.sku}_iso`,
-          iso.image,
-          bundleFolderId,
-        ),
+      const id = await uploadPreviewImage(
+        drive,
+        `${iso.sku}_iso`,
+        iso.image,
+        bundleFolderId,
       );
-    }
-
-    if (isolatedBundle) {
-      fileIds.push(
-        await uploadPreviewImage(
-          drive,
-          `${masterSku}_bundle_iso`,
-          isolatedBundle,
-          bundleFolderId,
-        ),
-      );
+      fileIds.push(id);
+      fileUrls.push(driveFileUrl(id));
     }
 
     return {
@@ -479,7 +609,9 @@ export async function commitBundleToDrive(
       ok: true,
       folderName,
       outputFolderId: bundleFolderId,
+      folderUrl: driveFolderUrl(bundleFolderId),
       fileIds,
+      fileUrls,
     };
   } catch (e) {
     const err = e instanceof Error ? e.message : String(e);
@@ -514,5 +646,6 @@ export async function processOneBundle(
     preview.preview.generated,
     preview.preview.isolatedPerSku,
     preview.preview.isolatedBundle,
+    preview.preview.referenceSourceFiles,
   );
 }

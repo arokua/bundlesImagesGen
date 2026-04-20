@@ -236,6 +236,30 @@ export async function uploadBufferAsFile(
   return id;
 }
 
+/**
+ * Copy an existing Drive file into a folder (same as “Make a copy” into a destination).
+ * Use for reference originals alongside generated uploads.
+ */
+export async function copyDriveFileToFolder(
+  drive: drive_v3.Drive,
+  sourceFileId: string,
+  newName: string,
+  parentFolderId: string,
+): Promise<string> {
+  const res = await drive.files.copy({
+    fileId: sourceFileId,
+    requestBody: {
+      name: newName,
+      parents: [parentFolderId],
+    },
+    fields: "id",
+    supportsAllDrives: true,
+  });
+  const id = res.data.id;
+  if (!id) throw new Error("Drive copy did not return file id.");
+  return id;
+}
+
 /** Any immediate child (file or folder); used to detect empty bundle output folders. */
 export async function countImmediateChildren(
   drive: drive_v3.Drive,

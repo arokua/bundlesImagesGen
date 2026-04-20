@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Bundle Gen",
+  title: "Bundle Images Generator",
   description: "Local bundle image generation for Google Drive e-commerce assets",
 };
 

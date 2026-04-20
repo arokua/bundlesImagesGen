@@ -1,15 +1,22 @@
 import { NextResponse } from "next/server";
-import { appendLesson, readLessonsBlock } from "@/lib/generateImages";
+import { appendProductLesson, formatProductLessonsBlock } from "@/lib/productLessons";
 
 export const maxDuration = 15;
 
-export async function GET() {
-  const block = await readLessonsBlock();
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  const masterSku = url.searchParams.get("masterSku")?.trim() ?? "";
+  if (!masterSku) {
+    return NextResponse.json(
+      { ok: true, lessonsBlock: "", hint: "Pass ?masterSku= to load product-specific lessons." },
+    );
+  }
+  const block = await formatProductLessonsBlock(masterSku);
   return NextResponse.json({ ok: true, lessonsBlock: block ?? "" });
 }
 
 export async function POST(request: Request) {
-  let body: { lesson?: string };
+  let body: { lesson?: string; masterSku?: string };
   try {
     body = await request.json();
   } catch {
@@ -17,9 +24,16 @@ export async function POST(request: Request) {
   }
 
   const lesson = body.lesson?.trim() ?? "";
+  const masterSku = body.masterSku?.trim() ?? "";
   if (!lesson) {
     return NextResponse.json(
       { error: "Provide a non-empty 'lesson' string." },
+      { status: 400 },
+    );
+  }
+  if (!masterSku) {
+    return NextResponse.json(
+      { error: "Provide 'masterSku' so the lesson is keyed to this product line." },
       { status: 400 },
     );
   }
@@ -31,7 +45,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    await appendLesson(lesson);
+    await appendProductLesson(masterSku, lesson);
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Failed to save lesson.";
     return NextResponse.json({ error: msg }, { status: 500 });

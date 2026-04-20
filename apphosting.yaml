@@ -1,0 +1,69 @@
+# Firebase App Hosting — Cloud Run + Next.js
+# https://firebase.google.com/docs/app-hosting/configure
+#
+# `secret:` must be the Secret Manager *name* (see firebase apphosting:secrets:set NAME).
+# Never put API keys or OAuth secrets as the value after `secret:`.
+#
+# OAuth redirect: the app derives https://<your-host>/api/auth/google/callback from the
+# request when GOOGLE_OAUTH_REDIRECT_URI is unset — register that exact URL under your
+# Web client → Authorized redirect URIs in Google Cloud Console.
+
+runConfig:
+  minInstances: 0
+
+env:
+  - variable: GEMINI_API_KEY
+    secret: GEMINI_API_KEY
+    availability:
+      - RUNTIME
+
+  - variable: GOOGLE_OAUTH_CLIENT_ID
+    secret: GOOGLE_OAUTH_CLIENT_ID
+    availability:
+      - RUNTIME
+
+  - variable: GOOGLE_OAUTH_CLIENT_SECRET
+    secret: GOOGLE_OAUTH_CLIENT_SECRET
+    availability:
+      - RUNTIME
+
+  # Matches Google Cloud → OAuth Web client → Authorized redirect URIs. Also used by Drive API auth after login.
+  - variable: GOOGLE_OAUTH_REDIRECT_URI
+    value: "https://my-image-gen-web-app--qtoys-bundle-image-generator.asia-southeast1.hosted.app/api/auth/google/callback"
+    availability:
+      - RUNTIME
+
+  - variable: GOOGLE_OAUTH_TOKEN_PATH
+    value: "/tmp/google-oauth.json"
+    availability:
+      - RUNTIME
+
+  - variable: PARENT_FOLDER_ID
+    value: "0B9ksIAlC-0_hU0sxTWQzRUVFaFU"
+    availability:
+      - RUNTIME
+
+  - variable: OUTPUT_FOLDER_ID
+    value: "1hXbv9ezpqMb3zM4_POOJOA_edtx1lAso"
+    availability:
+      - RUNTIME
+
+  - variable: GEMINI_IMAGE_MODEL
+    value: "gemini-2.5-flash-image"
+    availability:
+      - RUNTIME
+
+  - variable: GEMINI_IMAGES_PER_BUNDLE
+    value: "2"
+    availability:
+      - RUNTIME
+
+  - variable: GEMINI_MAX_RETRIES
+    value: "2"
+    availability:
+      - RUNTIME
+
+  - variable: GEMINI_RETRY_BASE_MS
+    value: "1500"
+    availability:
+      - RUNTIME

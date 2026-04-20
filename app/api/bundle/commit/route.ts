@@ -5,6 +5,7 @@ import {
   commitBundleToDrive,
   type IsolatedSkuPreview,
   type PreviewImagePayload,
+  type ReferenceSourceCopy,
 } from "@/lib/bundlePipeline";
 
 export const maxDuration = 120;
@@ -18,6 +19,7 @@ export async function POST(request: Request) {
     generated?: PreviewImagePayload[];
     isolatedPerSku?: IsolatedSkuPreview[];
     isolatedBundle?: PreviewImagePayload | null;
+    referenceSourceFiles?: ReferenceSourceCopy[];
   };
   try {
     body = await request.json();
@@ -112,6 +114,39 @@ export async function POST(request: Request) {
     isolatedBundle = body.isolatedBundle;
   }
 
+  const referenceSourceFiles: ReferenceSourceCopy[] = [];
+  if (body.referenceSourceFiles) {
+    if (!Array.isArray(body.referenceSourceFiles)) {
+      return NextResponse.json(
+        { error: "referenceSourceFiles must be an array." },
+        { status: 400 },
+      );
+    }
+    for (const r of body.referenceSourceFiles) {
+      if (
+        !r ||
+        typeof r.fileId !== "string" ||
+        !r.fileId.trim() ||
+        typeof r.name !== "string" ||
+        typeof r.sku !== "string" ||
+        !r.sku.trim()
+      ) {
+        return NextResponse.json(
+          {
+            error:
+              "Each referenceSourceFiles entry needs fileId, name, and sku.",
+          },
+          { status: 400 },
+        );
+      }
+      referenceSourceFiles.push({
+        fileId: r.fileId.trim(),
+        name: r.name,
+        sku: r.sku.trim(),
+      });
+    }
+  }
+
   let auth;
   try {
     auth = await getDriveAuth();
@@ -130,6 +165,7 @@ export async function POST(request: Request) {
     generated as PreviewImagePayload[],
     isolatedPerSku,
     isolatedBundle,
+    referenceSourceFiles,
   );
 
   if (!result.ok) {

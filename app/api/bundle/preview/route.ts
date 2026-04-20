@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
 import { getDriveAuth } from "@/lib/driveAuth";
 import { getDriveClient, listChildFolders } from "@/lib/drive";
-import { generateBundlePreview } from "@/lib/bundlePipeline";
+import {
+  collectBundleRefsOnly,
+  generateBundlePreview,
+} from "@/lib/bundlePipeline";
 import { parseBundleInput } from "@/lib/parseSkus";
 
 export const maxDuration = 300;
@@ -16,6 +19,9 @@ export async function POST(request: Request) {
     parentFolderId?: string;
     lineIndex?: number;
     seedOffset?: number;
+    refSelection?: Record<string, number>;
+    /** When true, only list Drive reference thumbnails + notes — no Gemini. */
+    refsOnly?: boolean;
   };
   try {
     body = await request.json();
@@ -80,12 +86,45 @@ export async function POST(request: Request) {
     ? await listChildFolders(drive, PARENT_FOLDER_FALLBACK_ID)
     : null;
 
+  const refSelection = body.refSelection;
+  const refSel =
+    refSelection && typeof refSelection === "object" && !Array.isArray(refSelection)
+      ? refSelection
+      : undefined;
+
+  if (body.refsOnly === true) {
+    const refsResult = await collectBundleRefsOnly(
+      drive,
+      bundle,
+      primaryChildFolders,
+      fallbackChildFolders,
+      refSel,
+    );
+    if (!refsResult.ok) {
+      return NextResponse.json(
+        {
+          ok: false,
+          lineIndex: refsResult.lineIndex,
+          error: refsResult.error,
+          parseErrors,
+        },
+        { status: 422 },
+      );
+    }
+    return NextResponse.json({
+      ok: true,
+      parseErrors,
+      previewRefs: refsResult.previewRefs,
+    });
+  }
+
   const result = await generateBundlePreview(
     drive,
     bundle,
     primaryChildFolders,
     fallbackChildFolders,
     seedOffset,
+    refSel,
   );
 
   if (!result.ok) {
