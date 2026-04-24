@@ -34,6 +34,7 @@ async function resolveFolder(
 }
 
 export async function GET() {
+  const requestId = crypto.randomUUID();
   const parentFolderId = process.env.PARENT_FOLDER_ID?.trim() || "";
   const outputFolderId = process.env.OUTPUT_FOLDER_ID?.trim() || "";
 
@@ -42,14 +43,17 @@ export async function GET() {
     resolveFolder(outputFolderId || undefined),
   ]);
 
-  return NextResponse.json({
-    defaults: {
-      parentFolderId: parentFolderId || null,
-      outputFolderId: outputFolderId || null,
+  return NextResponse.json(
+    {
+      defaults: {
+        parentFolderId: parentFolderId || null,
+        outputFolderId: outputFolderId || null,
+      },
+      resolved: {
+        parent,
+        output,
+      },
     },
-    resolved: {
-      parent,
-      output,
-    },
-  });
+    { headers: { "x-request-id": requestId } },
+  );
 }

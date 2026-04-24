@@ -7,24 +7,54 @@ import {
   type PreviewImagePayload,
   type ReferenceSourceCopy,
 } from "@/lib/bundlePipeline";
+import { bundleFilenameStem, skuOrderForFilenames } from "@/lib/bundleFolderName";
+import { getPreviewSessionImage } from "@/lib/previewImageStore";
 
 export const maxDuration = 120;
 
 export async function POST(request: Request) {
+  const requestId = crypto.randomUUID();
+  const json = (body: unknown, status = 200) =>
+    NextResponse.json(body, {
+      status,
+      headers: { "x-request-id": requestId },
+    });
+
   let body: {
     outputFolderId?: string;
     lineIndex?: number;
     folderName?: string;
     masterSku?: string;
-    generated?: PreviewImagePayload[];
-    isolatedPerSku?: IsolatedSkuPreview[];
-    isolatedBundle?: PreviewImagePayload | null;
+    /** All SKUs in the bundle (master first); used for output filenames when set. */
+    allSkus?: string[];
+    previewSessionId?: string;
+    generated?: Array<{
+      mimeType?: string;
+      dataBase64?: string;
+      fileId?: string;
+      url?: string;
+    }>;
+    isolatedPerSku?: Array<{
+      sku?: string;
+      image?: {
+        mimeType?: string;
+        dataBase64?: string;
+        fileId?: string;
+        url?: string;
+      };
+    }>;
+    isolatedBundle?: {
+      mimeType?: string;
+      dataBase64?: string;
+      fileId?: string;
+      url?: string;
+    } | null;
     referenceSourceFiles?: ReferenceSourceCopy[];
   };
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+    return json({ error: "Invalid JSON body." }, 400);
   }
 
   const outputFolderId =
@@ -34,92 +64,124 @@ export async function POST(request: Request) {
   const lineIndex = body.lineIndex;
   const folderName = body.folderName?.trim() ?? "";
   const masterSku = body.masterSku?.trim() ?? "";
-  const generated = body.generated;
+  const allSkusFromBody = Array.isArray(body.allSkus)
+    ? body.allSkus
+        .map((s) => (typeof s === "string" ? s.trim() : ""))
+        .filter(Boolean)
+    : [];
+  const previewSessionId = body.previewSessionId?.trim() ?? "";
+  const generatedRaw = body.generated;
 
   if (!outputFolderId) {
-    return NextResponse.json(
+    return json(
       {
         error:
           "Set outputFolderId in the request body or OUTPUT_FOLDER_ID in the environment.",
       },
-      { status: 400 },
+      400,
     );
   }
 
   if (lineIndex === undefined || lineIndex < 0) {
-    return NextResponse.json({ error: "Provide lineIndex." }, { status: 400 });
+    return json({ error: "Provide lineIndex." }, 400);
   }
 
-  if (!folderName || !masterSku) {
-    return NextResponse.json(
-      { error: "Provide folderName and masterSku." },
-      { status: 400 },
+  if (
+    !folderName ||
+    (!masterSku.length && allSkusFromBody.length === 0)
+  ) {
+    return json(
+      { error: "Provide folderName and masterSku (or allSkus)." },
+      400,
     );
   }
 
-  if (!Array.isArray(generated) || generated.length === 0) {
-    return NextResponse.json(
+  if (!Array.isArray(generatedRaw) || generatedRaw.length === 0) {
+    return json(
       { error: "Provide generated non-empty image array." },
-      { status: 400 },
+      400,
     );
   }
 
-  const isValidImg = (g: PreviewImagePayload | null | undefined): boolean =>
-    !!g &&
-    typeof g.dataBase64 === "string" &&
-    !!g.dataBase64 &&
-    typeof g.mimeType === "string";
+  const resolveImage = (
+    g:
+      | {
+          mimeType?: string;
+          dataBase64?: string;
+          fileId?: string;
+          url?: string;
+        }
+      | null
+      | undefined,
+  ): PreviewImagePayload | null => {
+    if (!g) return null;
+    if (typeof g.dataBase64 === "string" && g.dataBase64.trim().length > 0) {
+      if (typeof g.mimeType !== "string" || !g.mimeType.trim()) return null;
+      return { mimeType: g.mimeType, dataBase64: g.dataBase64 };
+    }
+    if (!previewSessionId || typeof g.fileId !== "string" || !g.fileId.trim()) {
+      return null;
+    }
+    return getPreviewSessionImage(previewSessionId, g.fileId.trim());
+  };
 
-  for (const g of generated) {
-    if (!isValidImg(g)) {
-      return NextResponse.json(
-        { error: "Each image needs mimeType and dataBase64." },
-        { status: 400 },
+  const generated: PreviewImagePayload[] = [];
+  for (const g of generatedRaw) {
+    const resolved = resolveImage(g);
+    if (!resolved) {
+      return json(
+        {
+          error:
+            "Each generated image must include dataBase64, or fileId with a valid previewSessionId.",
+        },
+        400,
       );
     }
+    generated.push(resolved);
   }
 
   const isolatedPerSku: IsolatedSkuPreview[] = [];
   if (body.isolatedPerSku) {
     if (!Array.isArray(body.isolatedPerSku)) {
-      return NextResponse.json(
+      return json(
         { error: "isolatedPerSku must be an array." },
-        { status: 400 },
+        400,
       );
     }
     for (const iso of body.isolatedPerSku) {
-      if (
-        !iso ||
-        typeof iso.sku !== "string" ||
-        !iso.sku.trim() ||
-        !isValidImg(iso.image)
-      ) {
-        return NextResponse.json(
+      const sku = iso?.sku;
+      const image = resolveImage(iso?.image);
+      if (!iso || typeof sku !== "string" || !sku.trim() || !image) {
+        return json(
           { error: "Each isolatedPerSku entry needs sku and image." },
-          { status: 400 },
+          400,
         );
       }
-      isolatedPerSku.push({ sku: iso.sku.trim(), image: iso.image });
+      isolatedPerSku.push({ sku: sku.trim(), image });
     }
   }
 
   let isolatedBundle: PreviewImagePayload | null = null;
   if (body.isolatedBundle) {
-    if (!isValidImg(body.isolatedBundle)) {
-      return NextResponse.json(
-        { error: "isolatedBundle needs mimeType and dataBase64." },
-        { status: 400 },
+    const image = resolveImage(body.isolatedBundle);
+    if (!image) {
+      return json(
+        {
+          error:
+            "isolatedBundle needs dataBase64, or fileId with a valid previewSessionId.",
+        },
+        400,
       );
     }
-    isolatedBundle = body.isolatedBundle;
+    isolatedBundle = image;
   }
 
   const referenceSourceFiles: ReferenceSourceCopy[] = [];
   if (body.referenceSourceFiles) {
     if (!Array.isArray(body.referenceSourceFiles)) {
-      return NextResponse.json(
+      return json(
         { error: "referenceSourceFiles must be an array." },
-        { status: 400 },
+        400,
       );
     }
     for (const r of body.referenceSourceFiles) {
@@ -131,12 +193,12 @@ export async function POST(request: Request) {
         typeof r.sku !== "string" ||
         !r.sku.trim()
       ) {
-        return NextResponse.json(
+        return json(
           {
             error:
               "Each referenceSourceFiles entry needs fileId, name, and sku.",
           },
-          { status: 400 },
+          400,
         );
       }
       referenceSourceFiles.push({
@@ -147,12 +209,67 @@ export async function POST(request: Request) {
     }
   }
 
+  // #region agent log
+  fetch("http://127.0.0.1:7707/ingest/72fe3a30-af19-4b80-9c22-4286b44eed04", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Debug-Session-Id": "b7e4fb",
+    },
+    body: JSON.stringify({
+      sessionId: "b7e4fb",
+      runId: "pre-fix",
+      hypothesisId: "H3",
+      location: "app/api/bundle/commit/route.ts:212",
+      message: "commit request sku inputs",
+      data: {
+        lineIndex,
+        masterSku,
+        allSkusFromBody,
+        allSkusBodyCount: allSkusFromBody.length,
+        referenceSkus: [...new Set(referenceSourceFiles.map((r) => r.sku))],
+        referenceSkuCount: [...new Set(referenceSourceFiles.map((r) => r.sku))].length,
+        generatedRawCount: generatedRaw.length,
+        generatedRawInlineCount: generatedRaw.filter((g) => !!g.dataBase64?.trim()).length,
+        generatedRawFileIdCount: generatedRaw.filter((g) => !!g.fileId?.trim()).length,
+      },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
+
+  const skuStemForFiles = bundleFilenameStem(
+    skuOrderForFilenames(masterSku, allSkusFromBody, referenceSourceFiles),
+  );
+
+  // #region agent log
+  fetch("http://127.0.0.1:7707/ingest/72fe3a30-af19-4b80-9c22-4286b44eed04", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Debug-Session-Id": "b7e4fb",
+    },
+    body: JSON.stringify({
+      sessionId: "b7e4fb",
+      runId: "pre-fix",
+      hypothesisId: "H3",
+      location: "app/api/bundle/commit/route.ts:233",
+      message: "computed sku stem for filenames",
+      data: {
+        lineIndex,
+        skuStemForFiles,
+      },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
+
   let auth;
   try {
     auth = await getDriveAuth();
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Drive auth failed.";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return json({ error: msg }, 500);
   }
 
   const drive = await getDriveClient(auth);
@@ -161,16 +278,16 @@ export async function POST(request: Request) {
     lineIndex,
     outputFolderId,
     folderName,
-    masterSku,
-    generated as PreviewImagePayload[],
+    skuStemForFiles,
+    generated,
     isolatedPerSku,
     isolatedBundle,
     referenceSourceFiles,
   );
 
   if (!result.ok) {
-    return NextResponse.json({ result }, { status: 422 });
+    return json({ result }, 422);
   }
 
-  return NextResponse.json({ ok: true, result });
+  return json({ ok: true, result });
 }

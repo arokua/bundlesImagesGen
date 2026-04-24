@@ -34,7 +34,18 @@ type BundleRow =
     }
   | { lineIndex: number; ok: false; error: string };
 
-type ImagePayload = { mimeType: string; dataBase64: string };
+type ImagePayload = {
+  mimeType: string;
+  dataBase64?: string;
+  fileId?: string;
+  url?: string;
+};
+
+type RefSelectionMap = Record<string, number[]>;
+type RenderSettings = {
+  addQsafeIcon: boolean;
+  qsafeIconUrl: string | null;
+};
 
 type RefsOnlyPayload = {
   lineIndex: number;
@@ -69,6 +80,7 @@ type PreviewPayload = {
   lineIndex: number;
   folderName: string;
   masterSku: string;
+  previewSessionId?: string;
   allSkus: string[];
   skuNotes: { sku: string; note: string }[];
   referenceFolders: {
@@ -95,7 +107,7 @@ type ReviewModalState = {
   preview: PreviewPayload;
   onChoose: (
     action: ReviewAction,
-    options?: { refSelection?: Record<string, number> },
+    options?: { refSelection?: RefSelectionMap },
   ) => void;
   uploadLabel?: string;
   skipLabel?: string;
@@ -119,8 +131,8 @@ type ReviewQueueItem = {
   seedOffset: number;
   status: ReviewQueueStatus;
   preview?: PreviewPayload;
-  /** Last ref image picks per Drive folder (folderId → image index). */
-  refSelection?: Record<string, number>;
+  /** Last ref image picks per Drive folder (folderId → image indexes). */
+  refSelection?: RefSelectionMap;
   error?: string;
   commitResult?: BundleRow;
 };
@@ -133,6 +145,32 @@ type ApiResult = {
 };
 
 type StreamProgress = { current: number; total: number };
+
+async function readJsonSafe<T>(
+  res: Response,
+  context: string,
+): Promise<T> {
+  const raw = await res.text();
+  const reqId = res.headers.get("x-request-id") ?? "n/a";
+  const contentType = res.headers.get("content-type") ?? "unknown";
+  try {
+    return JSON.parse(raw) as T;
+  } catch (e) {
+    const snippet = raw.slice(0, 400);
+    console.error(`[${context}] JSON parse failed`, {
+      requestId: reqId,
+      status: res.status,
+      contentType,
+      rawLength: raw.length,
+      snippet,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    throw new Error(
+      `${context} returned invalid JSON (requestId=${reqId}, status=${res.status}, contentType=${contentType}). ` +
+        "Open DevTools Network + Console with this requestId to debug.",
+    );
+  }
+}
 
 export default function Home() {
   const [text, setText] = useState("");
@@ -147,6 +185,7 @@ export default function Home() {
   const [streamProgress, setStreamProgress] = useState<StreamProgress | null>(
     null,
   );
+  const [refLoadStatus, setRefLoadStatus] = useState<string | null>(null);
   const [streamingResults, setStreamingResults] = useState<BundleRow[]>([]);
 
   const [dedupeLoading, setDedupeLoading] = useState(false);
@@ -179,6 +218,8 @@ export default function Home() {
     "multi" | "single"
   >("multi");
   const [refGateOpen, setRefGateOpen] = useState<RefGateOpenState | null>(null);
+  const [addQsafeIcon, setAddQsafeIcon] = useState(false);
+  const [qsafeIconUrl, setQsafeIconUrl] = useState("");
 
   const preview = useMemo(() => parseBundleInput(text), [text]);
 
@@ -186,7 +227,7 @@ export default function Home() {
     void (async () => {
       try {
         const res = await fetch("/api/bundle/drive-folders-config");
-        const data = (await res.json()) as {
+        const data = await readJsonSafe<{
           defaults?: {
             parentFolderId?: string | null;
             outputFolderId?: string | null;
@@ -203,7 +244,7 @@ export default function Home() {
               url: string;
             } | null;
           };
-        };
+        }>(res, "Drive folders config");
         setDriveFolderHints({
           parent: data.resolved?.parent ?? null,
           output: data.resolved?.output ?? null,
@@ -223,14 +264,15 @@ export default function Home() {
       try {
         setPromptRulesLoadError(null);
         const res = await fetch("/api/bundle/prompt-rules");
-        const data = (await res.json()) as {
+        const data = await readJsonSafe<{
           ok?: boolean;
           rules?: string;
           defaultLifestylePromptMulti?: string;
           defaultLifestylePromptSingle?: string;
           lifestylePrefixMulti?: string | null;
           lifestylePrefixSingle?: string | null;
-        };
+          renderSettings?: RenderSettings;
+        }>(res, "Prompt rules load");
         if (typeof data.rules === "string") {
           setGlobalPromptRules(data.rules);
         }
@@ -250,6 +292,8 @@ export default function Home() {
         setLifestylePrefixSingle(
           pickStoredLifestyle(data.lifestylePrefixSingle, LS_LIFESTYLE_SINGLE, ds),
         );
+        setAddQsafeIcon(!!data.renderSettings?.addQsafeIcon);
+        setQsafeIconUrl(data.renderSettings?.qsafeIconUrl ?? "");
       } catch (e) {
         setPromptRulesLoadError(
           e instanceof Error ? e.message : "Failed to load prompt rules.",
@@ -303,9 +347,13 @@ export default function Home() {
           stream: true,
         }),
       });
+      const requestId = res.headers.get("x-request-id") ?? "n/a";
 
       if (!res.ok) {
-        const data = (await res.json()) as { error?: string };
+        const data = await readJsonSafe<{ error?: string }>(
+          res,
+          "Bundle API",
+        );
         setApiResult({ error: data.error ?? `HTTP ${res.status}` });
         return;
       }
@@ -330,7 +378,7 @@ export default function Home() {
         buffer = lines.pop() ?? "";
         for (const line of lines) {
           if (!line.trim()) continue;
-          const evt = JSON.parse(line) as {
+          let evt: {
             type: string;
             parseErrors?: string[];
             bundlesParsed?: number;
@@ -339,6 +387,29 @@ export default function Home() {
             result?: BundleRow;
             message?: string;
           };
+          try {
+            evt = JSON.parse(line) as {
+              type: string;
+              parseErrors?: string[];
+              bundlesParsed?: number;
+              current?: number;
+              total?: number;
+              result?: BundleRow;
+              message?: string;
+            };
+          } catch {
+            console.error("[Bundle stream] NDJSON parse failed", {
+              requestId,
+              lineSnippet: line.slice(0, 400),
+              lineLength: line.length,
+            });
+            setApiResult({
+              error:
+                `Stream payload parse failed (requestId=${requestId}). Please retry this run.`,
+            });
+            setStreamProgress(null);
+            return;
+          }
 
           if (evt.type === "meta") {
             parseErrors = evt.parseErrors;
@@ -404,69 +475,207 @@ export default function Home() {
     setLoading(true);
     setApiResult(null);
     setStreamProgress(null);
+    setRefLoadStatus(null);
     setDedupeError(null);
     setReviewModal(null);
     setReviewQueue([]);
 
-    const items: RefGateItem[] = [];
-    let parseErrorsAcc: string[] | undefined;
-
     try {
-      for (let bi = 0; bi < bundles.length; bi++) {
-        const bundle = bundles[bi];
-        setStreamProgress({ current: bi + 1, total: bundles.length });
-        const res = await fetch("/api/bundle/preview", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text,
-            parentFolderId: parentFolderId || undefined,
-            lineIndex: bundle.lineIndex,
-            seedOffset: 0,
-            refsOnly: true,
-          }),
+      const total = bundles.length;
+      const maxConcurrent = 3;
+      const fetchRefsPass = async (forceAll: boolean) => {
+        const passItems: RefGateItem[] = [];
+        let passParseErrors: string[] | undefined;
+        let done = 0;
+        setStreamProgress({ current: 0, total });
+        const indexed = bundles.map((bundle, bi) => ({ bundle, bi }));
+        for (let start = 0; start < indexed.length; start += maxConcurrent) {
+          const batch = indexed.slice(start, start + maxConcurrent);
+          const batchItems = await Promise.all(
+            batch.map(async ({ bundle, bi }) => {
+              const res = await fetch("/api/bundle/preview", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  text,
+                  parentFolderId: parentFolderId || undefined,
+                  lineIndex: bundle.lineIndex,
+                  seedOffset: 0,
+                  refsOnly: true,
+                  refsOnlyForceAll: forceAll,
+                }),
+              });
+              const raw = await res.text();
+            let data: {
+              ok?: boolean;
+              error?: string;
+              parseErrors?: string[];
+              previewRefs?: RefsOnlyPayload;
+              lineIndex?: number;
+            };
+            try {
+              data = JSON.parse(raw) as {
+                ok?: boolean;
+                error?: string;
+                parseErrors?: string[];
+                previewRefs?: RefsOnlyPayload;
+                lineIndex?: number;
+              };
+            } catch {
+              throw new Error(
+                "Reference response was invalid/truncated in production. Retrying…",
+              );
+            }
+              if (!res.ok || data.ok === false || !data.previewRefs) {
+                throw new Error(
+                  data.error ?? "Failed to load reference images from Drive.",
+                );
+              }
+              const label =
+                bundle.name?.trim() ||
+                `${bundle.master} + ${bundle.components.join(" ")}`;
+              done += 1;
+              setStreamProgress({ current: done, total });
+              return {
+                bi,
+                parseErrors: data.parseErrors,
+                item: {
+                  lineIndex: bundle.lineIndex,
+                  bundleLabel: label,
+                  bundleIndex: bi,
+                  bundleTotal: bundles.length,
+                  refs: data.previewRefs,
+                } as RefGateItem,
+              };
+            }),
+          );
+          for (const v of batchItems) {
+            if (passParseErrors === undefined && v.parseErrors?.length) {
+              passParseErrors = v.parseErrors;
+            }
+            passItems.push(v.item);
+          }
+        }
+        passItems.sort((a, b) => a.bundleIndex - b.bundleIndex);
+        return { items: passItems, parseErrors: passParseErrors };
+      };
+
+      setRefLoadStatus("Loading references (lightest images first)...");
+      const loaded = await fetchRefsPass(false);
+      if (loaded.items.length === 0) {
+        throw new Error("No references loaded.");
+      }
+      setRefLoadStatus(null);
+      setRefGateOpen({ items: loaded.items, parseErrors: loaded.parseErrors, next });
+    } catch (e) {
+      try {
+        setRefLoadStatus(
+          "Standard load failed. Retrying in force mode (all images) — this can take longer...",
+        );
+        const forced = await (async () => {
+          const total = bundles.length;
+          const maxConcurrent = 1;
+          const passItems: RefGateItem[] = [];
+          let passParseErrors: string[] | undefined;
+          let done = 0;
+          setStreamProgress({ current: 0, total });
+          const indexed = bundles.map((bundle, bi) => ({ bundle, bi }));
+          for (let start = 0; start < indexed.length; start += maxConcurrent) {
+            const batch = indexed.slice(start, start + maxConcurrent);
+            const batchItems = await Promise.all(
+              batch.map(async ({ bundle, bi }) => {
+                const res = await fetch("/api/bundle/preview", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    text,
+                    parentFolderId: parentFolderId || undefined,
+                    lineIndex: bundle.lineIndex,
+                    seedOffset: 0,
+                    refsOnly: true,
+                    refsOnlyForceAll: true,
+                  }),
+                });
+                const raw = await res.text();
+                let data: {
+                  ok?: boolean;
+                  error?: string;
+                  parseErrors?: string[];
+                  previewRefs?: RefsOnlyPayload;
+                  lineIndex?: number;
+                };
+                try {
+                  data = JSON.parse(raw) as {
+                    ok?: boolean;
+                    error?: string;
+                    parseErrors?: string[];
+                    previewRefs?: RefsOnlyPayload;
+                    lineIndex?: number;
+                  };
+                } catch {
+                  throw new Error(
+                    "Forced-load response was invalid/truncated in production.",
+                  );
+                }
+                if (!res.ok || data.ok === false || !data.previewRefs) {
+                  throw new Error(
+                    data.error ?? "Failed to load reference images from Drive.",
+                  );
+                }
+                const label =
+                  bundle.name?.trim() ||
+                  `${bundle.master} + ${bundle.components.join(" ")}`;
+                done += 1;
+                setStreamProgress({ current: done, total });
+                return {
+                  bi,
+                  parseErrors: data.parseErrors,
+                  item: {
+                    lineIndex: bundle.lineIndex,
+                    bundleLabel: label,
+                    bundleIndex: bi,
+                    bundleTotal: bundles.length,
+                    refs: data.previewRefs,
+                  } as RefGateItem,
+                };
+              }),
+            );
+            for (const v of batchItems) {
+              if (passParseErrors === undefined && v.parseErrors?.length) {
+                passParseErrors = v.parseErrors;
+              }
+              passItems.push(v.item);
+            }
+          }
+          passItems.sort((a, b) => a.bundleIndex - b.bundleIndex);
+          return { items: passItems, parseErrors: passParseErrors };
+        })();
+        setRefLoadStatus(null);
+        setRefGateOpen({
+          items: forced.items,
+          parseErrors: forced.parseErrors,
+          next,
         });
-        const data = (await res.json()) as {
-          ok?: boolean;
-          error?: string;
-          parseErrors?: string[];
-          previewRefs?: RefsOnlyPayload;
-          lineIndex?: number;
-        };
-        if (parseErrorsAcc === undefined && data.parseErrors?.length) {
-          parseErrorsAcc = data.parseErrors;
-        }
-        if (!res.ok || data.ok === false || !data.previewRefs) {
-          setApiResult({
-            error: data.error ?? "Failed to load reference images from Drive.",
-          });
-          return;
-        }
-        const label =
-          bundle.name?.trim() ||
-          `${bundle.master} + ${bundle.components.join(" ")}`;
-        items.push({
-          lineIndex: bundle.lineIndex,
-          bundleLabel: label,
-          bundleIndex: bi,
-          bundleTotal: bundles.length,
-          refs: data.previewRefs,
+      } catch (forcedErr) {
+        setApiResult({
+          error:
+            forcedErr instanceof Error
+              ? forcedErr.message
+              : e instanceof Error
+                ? e.message
+                : "Failed to load references.",
         });
       }
-      setRefGateOpen({ items, parseErrors: parseErrorsAcc, next });
-    } catch (e) {
-      setApiResult({
-        error: e instanceof Error ? e.message : "Failed to load references.",
-      });
     } finally {
       setLoading(false);
       setStreamProgress(null);
+      setRefLoadStatus(null);
     }
   }
 
   /** Preview each bundle; user approves before Drive upload. */
   async function runWithReview(
-    lockedRefSelections: Record<number, Record<string, number>>,
+    lockedRefSelections: Record<number, RefSelectionMap>,
   ) {
     const bundles = preview.bundles;
     if (bundles.length === 0) return;
@@ -489,7 +698,7 @@ export default function Home() {
           bundle.name?.trim() ||
           `${bundle.master} + ${bundle.components.join(" ")}`;
         let seedOffset = 0;
-        let refSelectionForRequest: Record<string, number> | undefined =
+        let refSelectionForRequest: RefSelectionMap | undefined =
           lockedRefSelections[bundle.lineIndex];
 
         setStreamProgress({ current: bi + 1, total: bundles.length });
@@ -508,13 +717,13 @@ export default function Home() {
             }),
           });
 
-          const data = (await res.json()) as {
+          const data = await readJsonSafe<{
             ok?: boolean;
             error?: string;
             parseErrors?: string[];
             preview?: PreviewPayload;
             lineIndex?: number;
-          };
+          }>(res, "Bundle preview");
 
           if (parseErrorsAcc === undefined && data.parseErrors?.length) {
             parseErrorsAcc = data.parseErrors;
@@ -533,7 +742,7 @@ export default function Home() {
 
           const { action, refSelection } = await new Promise<{
             action: ReviewAction;
-            refSelection?: Record<string, number>;
+            refSelection?: RefSelectionMap;
           }>((resolve) => {
             setReviewModal({
               bundleLabel: label,
@@ -573,6 +782,8 @@ export default function Home() {
               lineIndex: bundle.lineIndex,
               folderName: data.preview.folderName,
               masterSku: data.preview.masterSku,
+              allSkus: data.preview.allSkus,
+              previewSessionId: data.preview.previewSessionId,
               generated: data.preview.generated,
               isolatedPerSku: data.preview.isolatedPerSku,
               isolatedBundle: data.preview.isolatedBundle,
@@ -580,11 +791,11 @@ export default function Home() {
             }),
           });
 
-          const commitJson = (await commitRes.json()) as {
+          const commitJson = await readJsonSafe<{
             ok?: boolean;
             error?: string;
             result?: BundleRow;
-          };
+          }>(commitRes, "Bundle commit");
 
           const cr = commitJson.result;
           if (cr?.ok) {
@@ -633,7 +844,7 @@ export default function Home() {
   async function fetchBundlePreview(
     lineIndex: number,
     seedOffset: number,
-    refSelection?: Record<string, number>,
+    refSelection?: RefSelectionMap,
   ): Promise<
     | { ok: true; preview: PreviewPayload; parseErrors?: string[] }
     | { ok: false; lineIndex: number; error: string; parseErrors?: string[] }
@@ -650,13 +861,44 @@ export default function Home() {
           refSelection,
         }),
       });
-      const data = (await res.json()) as {
+      const data = await readJsonSafe<{
         ok?: boolean;
         error?: string;
         parseErrors?: string[];
         preview?: PreviewPayload;
         lineIndex?: number;
-      };
+      }>(res, "Bundle preview");
+      // #region agent log
+      fetch("http://127.0.0.1:7707/ingest/72fe3a30-af19-4b80-9c22-4286b44eed04", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Debug-Session-Id": "b7e4fb",
+        },
+        body: JSON.stringify({
+          sessionId: "b7e4fb",
+          runId: "pre-fix",
+          hypothesisId: "H2",
+          location: "app/page.tsx:871",
+          message: "bundle preview response shape",
+          data: {
+            lineIndex,
+            status: res.status,
+            ok: data.ok ?? null,
+            hasPreview: !!data.preview,
+            generatedCount: data.preview?.generated?.length ?? 0,
+            generatedInlineCount:
+              data.preview?.generated?.filter((g) => !!g.dataBase64?.trim()).length ?? 0,
+            generatedUrlCount:
+              data.preview?.generated?.filter((g) => !!g.url?.trim()).length ?? 0,
+            isolatedInlineCount:
+              data.preview?.isolatedPerSku?.filter((i) => !!i.image.dataBase64?.trim()).length ?? 0,
+            allSkus: data.preview?.allSkus ?? [],
+          },
+          timestamp: Date.now(),
+        }),
+      }).catch(() => {});
+      // #endregion
       if (!res.ok || data.ok === false || !data.preview) {
         return {
           ok: false,
@@ -680,7 +922,7 @@ export default function Home() {
   }
 
   async function runPreviewQueue(
-    lockedRefSelections: Record<number, Record<string, number>>,
+    lockedRefSelections: Record<number, RefSelectionMap>,
   ) {
     const bundles = preview.bundles;
     if (bundles.length === 0) return;
@@ -752,7 +994,7 @@ export default function Home() {
 
   async function regenerateQueuePreview(
     item: ReviewQueueItem,
-    refSelection?: Record<string, number>,
+    refSelection?: RefSelectionMap,
   ) {
     const nextSeed = item.seedOffset + 1;
     const sel = refSelection ?? item.refSelection;
@@ -847,6 +1089,8 @@ export default function Home() {
             lineIndex: item.lineIndex,
             folderName: item.preview.folderName,
             masterSku: item.preview.masterSku,
+            allSkus: item.preview.allSkus,
+            previewSessionId: item.preview.previewSessionId,
             generated: item.preview.generated,
             isolatedPerSku: item.preview.isolatedPerSku,
             isolatedBundle: item.preview.isolatedBundle,
@@ -854,11 +1098,11 @@ export default function Home() {
           }),
         });
 
-        const commitJson = (await commitRes.json()) as {
+        const commitJson = await readJsonSafe<{
           ok?: boolean;
           error?: string;
           result?: BundleRow;
-        };
+        }>(commitRes, "Bundle commit");
         const cr = commitJson.result;
         if (cr?.ok) {
           results.push(cr);
@@ -908,9 +1152,16 @@ export default function Home() {
           rules: globalPromptRules,
           lifestylePrefixMulti,
           lifestylePrefixSingle,
+          renderSettings: {
+            addQsafeIcon,
+            qsafeIconUrl: qsafeIconUrl.trim() || null,
+          },
         }),
       });
-      const data = (await res.json()) as { ok?: boolean; error?: string };
+      const data = await readJsonSafe<{ ok?: boolean; error?: string }>(
+        res,
+        "Prompt rules save",
+      );
       if (!res.ok || !data.ok) {
         setGlobalPromptStatus("error");
         setGlobalPromptError(data.error ?? `HTTP ${res.status}`);
@@ -937,10 +1188,10 @@ export default function Home() {
           outputFolderId: outputFolderId || undefined,
         }),
       });
-      const data = (await res.json()) as {
+      const data = await readJsonSafe<{
         error?: string;
         trashedFolderIds?: string[];
-      };
+      }>(res, "Dedupe output");
       if (!res.ok) {
         setDedupeError(data.error ?? `HTTP ${res.status}`);
         return;
@@ -991,9 +1242,23 @@ export default function Home() {
             What to do
           </h2>
           <ol className="mt-4 list-none space-y-4 text-sm">
-            <li className="flex gap-3">
+          <li className="flex gap-3">
               <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-sm font-bold text-white">
                 1
+              </span>
+              <div>
+                <p className="font-medium text-zinc-900 dark:text-zinc-100">
+                  Connect Google Drive
+                </p>
+                <p className="mt-0.5 text-zinc-600 dark:text-zinc-400">
+                  Authorize Google Drive Drive first so it can connect to your Drive. Then paste the two
+                  folder codes.
+                </p>
+              </div>
+            </li>
+            <li className="flex gap-3">
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-sm font-bold text-white">
+                2
               </span>
               <div>
                 <p className="font-medium text-zinc-900 dark:text-zinc-100">
@@ -1004,21 +1269,7 @@ export default function Home() {
                 </p>
               </div>
             </li>
-            <li className="flex gap-3">
-              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-sm font-bold text-white">
-                2
-              </span>
-              <div>
-                <p className="font-medium text-zinc-900 dark:text-zinc-100">
-                  Connect Google Drive
-                </p>
-                <p className="mt-0.5 text-zinc-600 dark:text-zinc-400">
-                  Authorize Drive first (big blue button in step 2). Then paste the two
-                  folder codes. This can take a while — see &quot;Plan time&quot; at
-                  the top.
-                </p>
-              </div>
-            </li>
+            
             <li className="flex gap-3">
               <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-sm font-bold text-white">
                 3
@@ -1030,7 +1281,7 @@ export default function Home() {
                 <p className="mt-0.5 text-zinc-600 dark:text-zinc-400">
                   Section &quot;What we understood&quot; must look right. Optional:
                   expand &quot;Optional — change how…&quot; only if you need different
-                  photo wording (most people skip).
+                  photo wording.
                 </p>
               </div>
             </li>
@@ -1052,56 +1303,17 @@ export default function Home() {
           </ol>
         </section>
 
-        <section className="space-y-3">
-          <div>
-            <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-              1. Your bundle list
-            </h2>
-            <p className="mt-0.5 text-xs text-zinc-500">
-              One bundle per line. You can paste text or upload CSV / text file.
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <label className="sr-only" htmlFor="skus">
-              Bundle list
-            </label>
-            <label className="text-sm text-zinc-600 dark:text-zinc-400">
-              <span className="mr-2">Upload file</span>
-              <input
-                type="file"
-                accept=".csv,.txt,text/csv,text/plain"
-                className="text-xs file:mr-2 file:rounded file:border-0 file:bg-zinc-200 file:px-2 file:py-1 dark:file:bg-zinc-700"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) loadFile(f);
-                  e.target.value = "";
-                }}
-              />
-            </label>
-          </div>
-          <textarea
-            id="skus"
-            className="min-h-48 w-full rounded-lg border border-zinc-200 bg-white p-3 font-mono text-sm shadow-sm focus:border-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-300 dark:border-zinc-700 dark:bg-zinc-900 dark:focus:ring-zinc-600"
-            placeholder={`CSV example:\nname,SKU,description\nWinter set,ABC-1 DEF-2,"Cozy layering"\n\nText example:\nSummer Kit | SHIRT-9 HAT-3`}
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-          />
-          {preview.format === "csv" && (
-            <p className="text-xs text-emerald-700 dark:text-emerald-400">
-              We detected a spreadsheet-style file (names and product codes).
-            </p>
-          )}
-        </section>
+        
 
         <section className="grid gap-4 sm:grid-cols-2">
           <div className="sm:col-span-2 rounded-xl border-2 border-amber-400 bg-gradient-to-b from-amber-50 to-amber-100/80 p-5 shadow-lg dark:border-amber-500 dark:from-amber-950/80 dark:to-amber-950/40">
             <p className="text-base font-bold tracking-tight text-amber-950 dark:text-amber-50">
-              Step 2 — Authorize Google Drive first (required)
+              Step 1 — Authorize Google Drive once per browser session (required, if exit tab, have to reauthorize)
+              Reauthorize by customerservice@qtoys.com.au only.
             </p>
             <p className="mt-2 text-sm leading-snug text-amber-950/90 dark:text-amber-100/90">
               The app cannot read your product photos or save finished images until you
-              sign in and allow access. Use the Google account that owns these
-              folders. You may only need to do this once per browser.
+              sign in and allow access.
             </p>
             <a
               href="/api/auth/google"
@@ -1112,11 +1324,12 @@ export default function Home() {
           </div>
           <div className="sm:col-span-2">
             <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
-              2. Google Drive folders
+              1. Google Drive folders
             </h2>
             <p className="mt-0.5 text-xs text-zinc-500">
               After authorizing, open each folder in Google Drive and copy the long ID
               from the browser address bar into the boxes below.
+              Default location at Product Images Database and Bundles folder have been set.
             </p>
           </div>
           <div className="space-y-1">
@@ -1186,6 +1399,47 @@ export default function Home() {
             )}
           </div>
         </section>
+        
+        <section className="space-y-3">
+          <div>
+            <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+              2 . Your bundle list
+            </h2>
+            <p className="mt-0.5 text-xs text-zinc-500">
+              One bundle per line. You can paste text or upload CSV / text file.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <label className="sr-only" htmlFor="skus">
+              Bundle list
+            </label>
+            <label className="text-sm text-zinc-600 dark:text-zinc-400">
+              <span className="mr-2">Upload file</span>
+              <input
+                type="file"
+                accept=".csv,.txt,text/csv,text/plain"
+                className="text-xs file:mr-2 file:rounded file:border-0 file:bg-zinc-200 file:px-2 file:py-1 dark:file:bg-zinc-700"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) loadFile(f);
+                  e.target.value = "";
+                }}
+              />
+            </label>
+          </div>
+          <textarea
+            id="skus"
+            className="min-h-48 w-full rounded-lg border border-zinc-200 bg-white p-3 font-mono text-sm shadow-sm focus:border-zinc-400 focus:outline-none focus:ring-2 focus:ring-zinc-300 dark:border-zinc-700 dark:bg-zinc-900 dark:focus:ring-zinc-600"
+            placeholder={`CSV example:\nname,SKU,description\nWinter set,ABC-1 DEF-2,"Cozy layering"\nSingle item,123456,\n\nText examples:\nSummer Kit | SHIRT-9 HAT-3\nSingle toy | 123456\n123456`}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+          />
+          {preview.format === "csv" && (
+            <p className="text-xs text-emerald-700 dark:text-emerald-400">
+              We detected a spreadsheet-style file (names and product codes).
+            </p>
+          )}
+        </section>
 
         <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
           <h2 className="mb-1 text-sm font-semibold text-zinc-900 dark:text-zinc-100">
@@ -1220,15 +1474,17 @@ export default function Home() {
                       {b.description}
                     </div>
                   )}
-                  <span className="font-mono text-emerald-700 dark:text-emerald-400">
-                    {b.master}
-                  </span>
-                  <span className="text-zinc-500"> + </span>
-                  {b.components.map((c) => (
-                    <span key={c} className="font-mono text-zinc-700 dark:text-zinc-300">
-                      {c}{" "}
-                    </span>
-                  ))}
+                  <span className="font-mono text-emerald-700 dark:text-emerald-400">{b.master}</span>
+                  {b.components.length > 0 && (
+                    <>
+                      <span className="text-zinc-500"> + </span>
+                      {b.components.map((c) => (
+                        <span key={c} className="font-mono text-zinc-700 dark:text-zinc-300">
+                          {c}{" "}
+                        </span>
+                      ))}
+                    </>
+                  )}
                 </li>
               ))}
             </ul>
@@ -1313,6 +1569,36 @@ export default function Home() {
               }}
               maxLength={12000}
             />
+            <h3 className="mb-1 mt-4 text-xs font-medium text-zinc-700 dark:text-zinc-300">
+              Optional image overlays
+            </h3>
+            <div className="space-y-2 rounded border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-900/50">
+              <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+                <input
+                  type="checkbox"
+                  checked={addQsafeIcon}
+                  onChange={(e) => {
+                    setAddQsafeIcon(e.target.checked);
+                    if (globalPromptStatus !== "idle") setGlobalPromptStatus("idle");
+                  }}
+                />
+                Add QSAFE icon (bundle images only, top-right)
+              </label>
+              <div className="space-y-1">
+                <label className="text-[11px] text-zinc-600 dark:text-zinc-400">
+                  QSAFE icon URL (https://...)
+                </label>
+                <input
+                  className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-600 dark:bg-zinc-900"
+                  value={qsafeIconUrl}
+                  onChange={(e) => {
+                    setQsafeIconUrl(e.target.value);
+                    if (globalPromptStatus !== "idle") setGlobalPromptStatus("idle");
+                  }}
+                  placeholder="https://.../qsafe-icon.png"
+                />
+              </div>
+            </div>
             <div className="mt-2 flex flex-wrap items-center gap-2">
               <button
                 type="button"
@@ -1348,8 +1634,8 @@ export default function Home() {
               This process is not instant
             </span>
             — loading references and generating each set of images can take several
-            minutes; large queues take longer. Keep this tab open until each step
-            finishes.
+            minutes; large queues take longer. You can switch tab but don&apos;t
+            close it or all progress is lost.
           </p>
           <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:flex-wrap">
             <button
@@ -1421,6 +1707,11 @@ export default function Home() {
             <p className="text-xs text-zinc-500">
               Working — this can take several minutes. Please wait.
             </p>
+            {refLoadStatus && (
+              <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
+                {refLoadStatus}
+              </p>
+            )}
             <div className="flex justify-between text-xs text-zinc-600 dark:text-zinc-400">
               <span>Progress</span>
               <span>
@@ -1657,16 +1948,73 @@ function uniqueOrdered(arr: string[]): string[] {
 
 function initRefSelFromRefs(p: {
   referenceFolders: { folderId: string }[];
-}): Record<string, number> {
-  const m: Record<string, number> = {};
+}): RefSelectionMap {
+  const m: RefSelectionMap = {};
   for (const rf of p.referenceFolders) {
-    m[rf.folderId] = 0;
+    m[rf.folderId] = [0];
   }
   return m;
 }
 
-function initRefSel(p: PreviewPayload): Record<string, number> {
+function initRefSel(p: PreviewPayload): RefSelectionMap {
   return initRefSelFromRefs(p);
+}
+
+function bundleSkuLabel(skus: string[]): string {
+  const u = [...new Set(skus.map((s) => s.trim()).filter(Boolean))];
+  return u.join(" ") || "";
+}
+
+function imageSrc(img: ImagePayload): string {
+  if (img.dataBase64?.trim()) return `data:${img.mimeType};base64,${img.dataBase64}`;
+  if (img.url?.trim()) {
+    // #region agent log
+    fetch("http://127.0.0.1:7707/ingest/72fe3a30-af19-4b80-9c22-4286b44eed04", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Debug-Session-Id": "b7e4fb",
+      },
+      body: JSON.stringify({
+        sessionId: "b7e4fb",
+        runId: "pre-fix",
+        hypothesisId: "H2",
+        location: "app/page.tsx:1940",
+        message: "imageSrc fell back to url",
+        data: {
+          mimeType: img.mimeType,
+          hasUrl: true,
+          hasDataBase64: false,
+        },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
+    return img.url;
+  }
+  // #region agent log
+  fetch("http://127.0.0.1:7707/ingest/72fe3a30-af19-4b80-9c22-4286b44eed04", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Debug-Session-Id": "b7e4fb",
+    },
+    body: JSON.stringify({
+      sessionId: "b7e4fb",
+      runId: "pre-fix",
+      hypothesisId: "H4",
+      location: "app/page.tsx:1945",
+      message: "imageSrc had no usable payload",
+      data: {
+        mimeType: img.mimeType,
+        hasUrl: false,
+        hasDataBase64: false,
+      },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
+  return "";
 }
 
 type RefFolderForSku = {
@@ -1680,14 +2028,18 @@ function SkuReferenceCard({
   sku,
   initialNote,
   folders,
-  selectedRefIndexByFolderId,
+  selectedRefIndexesByFolderId,
   onSelectFolderRef,
 }: {
   sku: string;
   initialNote: string;
   folders: RefFolderForSku[];
-  selectedRefIndexByFolderId: Record<string, number>;
-  onSelectFolderRef: (folderId: string, imageIndex: number) => void;
+  selectedRefIndexesByFolderId: RefSelectionMap;
+  onSelectFolderRef: (
+    folderId: string,
+    imageIndex: number,
+    checked: boolean,
+  ) => void;
 }) {
   const [note, setNote] = useState(initialNote);
   const [baseline, setBaseline] = useState(initialNote);
@@ -1707,11 +2059,11 @@ function SkuReferenceCard({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sku, note }),
       });
-      const data = (await res.json()) as {
+      const data = await readJsonSafe<{
         ok?: boolean;
         error?: string;
         note?: string;
-      };
+      }>(res, "SKU note save");
       if (!res.ok || !data.ok) {
         setStatus("error");
         setError(data.error ?? `HTTP ${res.status}`);
@@ -1800,32 +2152,36 @@ function SkuReferenceCard({
                 Folder: {rf.folderName}
               </p>
               <p className="mt-1 text-[10px] text-zinc-500">
-                Tap one photo. If you change your mind later, use &quot;Make new
-                images&quot; in the next screen.
+                Select one or more photos. Selected photos are used for generation
+                and copied into the output folder.
               </p>
               <div className="mt-2 flex flex-wrap gap-2">
                 {rf.images.map((img, ii) => {
-                  const picked =
-                    selectedRefIndexByFolderId[rf.folderId] === ii;
+                  const selected =
+                    selectedRefIndexesByFolderId[rf.folderId]?.includes(ii) ??
+                    false;
                   return (
                     <label
                       key={`${rf.folderId}-${ii}`}
                       className={`flex cursor-pointer flex-col gap-0.5 rounded border p-1 transition-colors ${
-                        picked
+                        selected
                           ? "border-emerald-500 ring-2 ring-emerald-400/80 dark:ring-emerald-600"
                           : "border-zinc-200 dark:border-zinc-600"
                       }`}
                     >
                       <input
-                        type="radio"
+                        type="checkbox"
                         className="sr-only"
-                        name={`refpick-${rf.folderId}`}
-                        checked={picked}
-                        onChange={() => onSelectFolderRef(rf.folderId, ii)}
+                        checked={selected}
+                        onChange={(e) =>
+                          onSelectFolderRef(rf.folderId, ii, e.target.checked)
+                        }
                       />
                       <img
-                        src={`data:${img.mimeType};base64,${img.dataBase64}`}
+                        src={imageSrc(img)}
                         alt={`${rf.folderName} ref ${ii + 1}`}
+                        loading="lazy"
+                        decoding="async"
                         className="h-28 w-28 rounded border border-zinc-200 object-cover dark:border-zinc-600"
                       />
                       <span className="text-center font-mono text-[10px] text-zinc-500">
@@ -1849,13 +2205,13 @@ function ReferenceGateModal({
   onCancel,
 }: {
   state: RefGateOpenState;
-  onConfirm: (sel: Record<number, Record<string, number>>) => void;
+  onConfirm: (sel: Record<number, RefSelectionMap>) => void;
   onCancel: () => void;
 }) {
   const [selByLine, setSelByLine] = useState<
-    Record<number, Record<string, number>>
+    Record<number, RefSelectionMap>
   >(() => {
-    const m: Record<number, Record<string, number>> = {};
+    const m: Record<number, RefSelectionMap> = {};
     for (const it of state.items) {
       m[it.lineIndex] = initRefSelFromRefs(it.refs);
     }
@@ -1917,16 +2273,27 @@ function ReferenceGateModal({
                       sku={sku}
                       initialNote={initialNote}
                       folders={folders}
-                      selectedRefIndexByFolderId={
+                      selectedRefIndexesByFolderId={
                         selByLine[it.lineIndex] ?? initRefSelFromRefs(it.refs)
                       }
-                      onSelectFolderRef={(folderId, imageIndex) =>
+                      onSelectFolderRef={(folderId, imageIndex, checked) =>
                         setSelByLine((prev) => ({
                           ...prev,
                           [it.lineIndex]: {
                             ...(prev[it.lineIndex] ??
                               initRefSelFromRefs(it.refs)),
-                            [folderId]: imageIndex,
+                            [folderId]: (() => {
+                              const cur =
+                                prev[it.lineIndex]?.[folderId] ??
+                                initRefSelFromRefs(it.refs)[folderId] ??
+                                [];
+                              if (checked) {
+                                const next = [...cur, imageIndex];
+                                return [...new Set(next)].sort((a, b) => a - b);
+                              }
+                              const next = cur.filter((x) => x !== imageIndex);
+                              return next.length > 0 ? next : [cur[0] ?? imageIndex];
+                            })(),
                           },
                         }))
                       }
@@ -1960,7 +2327,7 @@ function ReferenceGateModal({
 }
 
 function ReviewModal({ state }: { state: ReviewModalState }) {
-  const [refSel, setRefSel] = useState<Record<string, number>>(() =>
+  const [refSel, setRefSel] = useState<RefSelectionMap>(() =>
     initRefSel(state.preview),
   );
   const [lesson, setLesson] = useState("");
@@ -1983,7 +2350,10 @@ function ReviewModal({ state }: { state: ReviewModalState }) {
           masterSku: state.preview.masterSku,
         }),
       });
-      const data = (await res.json()) as { ok?: boolean; error?: string };
+      const data = await readJsonSafe<{ ok?: boolean; error?: string }>(
+        res,
+        "Lesson save",
+      );
       if (!res.ok || !data.ok) {
         setLessonStatus("error");
         setLessonError(data.error ?? `HTTP ${res.status}`);
@@ -2067,9 +2437,24 @@ function ReviewModal({ state }: { state: ReviewModalState }) {
                   sku={sku}
                   initialNote={initialNote}
                   folders={folders}
-                  selectedRefIndexByFolderId={refSel}
-                  onSelectFolderRef={(folderId, imageIndex) =>
-                    setRefSel((prev) => ({ ...prev, [folderId]: imageIndex }))
+                  selectedRefIndexesByFolderId={refSel}
+                  onSelectFolderRef={(folderId, imageIndex, checked) =>
+                    setRefSel((prev) => {
+                      const cur = prev[folderId] ?? [0];
+                      if (checked) {
+                        return {
+                          ...prev,
+                          [folderId]: [...new Set([...cur, imageIndex])].sort(
+                            (a, b) => a - b,
+                          ),
+                        };
+                      }
+                      const next = cur.filter((x) => x !== imageIndex);
+                      return {
+                        ...prev,
+                        [folderId]: next.length > 0 ? next : [cur[0] ?? imageIndex],
+                      };
+                    })
                   }
                 />
               );
@@ -2085,8 +2470,8 @@ function ReviewModal({ state }: { state: ReviewModalState }) {
             {preview.generated.map((img, i) => (
               <img
                 key={i}
-                src={`data:${img.mimeType};base64,${img.dataBase64}`}
-                alt={`Generated ${i + 1}`}
+                src={imageSrc(img)}
+                alt={`Bundle ${bundleSkuLabel(preview.allSkus)} · lifestyle ${i + 1}`}
                 className="max-h-80 max-w-full rounded-lg border border-zinc-200 object-contain dark:border-zinc-600"
               />
             ))}
@@ -2108,12 +2493,12 @@ function ReviewModal({ state }: { state: ReviewModalState }) {
                   className="flex flex-col items-center gap-1"
                 >
                   <img
-                    src={`data:${iso.image.mimeType};base64,${iso.image.dataBase64}`}
-                    alt={`Isolated ${iso.sku}`}
+                    src={imageSrc(iso.image)}
+                    alt={`Bundle ${bundleSkuLabel(preview.allSkus)} · isolated ${iso.sku}`}
                     className="h-44 w-44 rounded-lg border border-zinc-200 object-contain bg-white dark:border-zinc-600"
                   />
                   <figcaption className="font-mono text-xs text-zinc-600 dark:text-zinc-400">
-                    {iso.sku}
+                    {`${bundleSkuLabel(preview.allSkus)} · ${iso.sku}`}
                   </figcaption>
                 </figure>
               ))}
@@ -2130,7 +2515,7 @@ function ReviewModal({ state }: { state: ReviewModalState }) {
               One extra file with every product in a row.
             </p>
             <img
-              src={`data:${preview.isolatedBundle.mimeType};base64,${preview.isolatedBundle.dataBase64}`}
+              src={imageSrc(preview.isolatedBundle)}
               alt="Isolated bundle"
               className="max-h-80 max-w-full rounded-lg border border-zinc-200 object-contain bg-white dark:border-zinc-600"
             />

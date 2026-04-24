@@ -28,6 +28,13 @@ type NdjsonEvent =
   | { type: "error"; message: string };
 
 export async function POST(request: Request) {
+  const requestId = crypto.randomUUID();
+  const json = (body: unknown, status = 200) =>
+    NextResponse.json(body, {
+      status,
+      headers: { "x-request-id": requestId },
+    });
+
   let body: {
     text?: string;
     parentFolderId?: string;
@@ -37,7 +44,7 @@ export async function POST(request: Request) {
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+    return json({ error: "Invalid JSON body." }, 400);
   }
 
   const parentFolderId =
@@ -50,19 +57,19 @@ export async function POST(request: Request) {
     "";
 
   if (!parentFolderId || !outputFolderId) {
-    return NextResponse.json(
+    return json(
       {
         error:
           "Set parentFolderId and outputFolderId in the request body or PARENT_FOLDER_ID and OUTPUT_FOLDER_ID in the environment.",
       },
-      { status: 400 },
+      400,
     );
   }
 
   const text = body.text ?? "";
   const { bundles, errors: parseErrors } = parseBundleInput(text);
   if (parseErrors.length > 0 && bundles.length === 0) {
-    return NextResponse.json({ errors: parseErrors, results: [] }, { status: 400 });
+    return json({ errors: parseErrors, results: [] }, 400);
   }
 
   let auth;
@@ -70,7 +77,7 @@ export async function POST(request: Request) {
     auth = await getDriveAuth();
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Drive auth failed.";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return json({ error: msg }, 500);
   }
 
   const drive = await getDriveClient(auth);
@@ -131,6 +138,7 @@ export async function POST(request: Request) {
       headers: {
         "Content-Type": "application/x-ndjson; charset=utf-8",
         "Cache-Control": "no-store",
+        "x-request-id": requestId,
       },
     });
   }
@@ -148,7 +156,7 @@ export async function POST(request: Request) {
     );
   }
 
-  return NextResponse.json({
+  return json({
     parseErrors,
     results,
     bundlesParsed: bundles.length,

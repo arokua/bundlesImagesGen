@@ -47,6 +47,15 @@ env:
     value: "1hXbv9ezpqMb3zM4_POOJOA_edtx1lAso"
     availability:
       - RUNTIME
+  - variable: GEMINI_ADD_QSAFE_ICON
+    value: true
+    availability:
+      - RUNTIME
+  
+  - variable: GEMINI_QSAFE_ICON_URL
+    value: "https://www.qtoys.com.au/wp-content/uploads/2026/04/QSafe-no-background-1.png"
+    availability:
+      - RUNTIME
 
   - variable: GEMINI_IMAGE_MODEL
     value: "gemini-2.5-flash-image"
@@ -55,6 +64,12 @@ env:
 
   - variable: GEMINI_IMAGES_PER_BUNDLE
     value: "2"
+    availability:
+      - RUNTIME
+
+  # Faster "choose references" modal load; lower = smaller payload + quicker response.
+  - variable: GEMINI_REFS_ONLY_IMAGES_PER_FOLDER
+    value: "5"
     availability:
       - RUNTIME
 

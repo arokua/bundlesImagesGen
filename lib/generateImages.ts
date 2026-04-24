@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import sharp from "sharp";
 import {
   ApiError,
   GoogleGenAI,
@@ -12,47 +13,49 @@ import {
 /** Prefer stable image model; preview / 3.x models often have stricter quotas. Override with GEMINI_IMAGE_MODEL. */
 const DEFAULT_MODEL = "gemini-2.5-flash-image";
 
-const FIDELITY_BLOCK = `Strict :
-- Depict ONLY the real products shown in the reference images below. Arrange them together in one believable e-commerce scene.
-- Do NOT add any extra products, props, toys, packaging, labels, text overlays, or objects that are not clearly the same items as in the references.
-- Do NOT invent items to match a title, SKU, or marketing text. If something is not in the references, it must not appear.
-- Keep each product’s identity (shape, color, material) consistent with the references.
-- Preserve realistic relative scale: do not invent a new size relationship between items; keep each product’s apparent size believable compared to the references.
-- Keep all products in the same plane/ surface.
-- Use lighting that is consistent with the references, one light source only.
-- Use camera angle that is consistent with the references.
-- Use camera position that is consistent with the references.
-- Use camera focal length that is consistent with the references.
-- Use camera aperture that is consistent with the references.
-- Use camera shutter speed that is consistent with the references.
-- Use camera ISO that is consistent with the references.
-- Use camera exposure compensation that is consistent with the references.
+const FIDELITY_BLOCK = `Strict reference lock:
+- Show only the real product(s) visible in references.
+- No extra props, text overlays, watermarks, fake brands, or invented packaging.
+- Keep product identity, material, color, and relative size faithful.
+- Match reference lighting, lens feel, and realism.
 
+Printed logos / text:
+- Never invent or guess logo words.
+- If exact letters are unclear, use plain texture instead of fake readable text.
+- Never render standalone corner logos or corner brand text in generated pixels.
+- Do not add corner logos or brand bugs unless explicitly requested by render settings.`;
 
-Printed logos & brand text (critical — common failure mode):
-- Do NOT invent, guess, or substitute brand names, stamps, or logos. Never output **fake or mis-spelled** text where a real brand mark appears (e.g. wrong letters like “LISET” / “LSSET” instead of the real mark in the references).
-- If references show a logo or stamp on the product (e.g. burned or printed on wood), match that text **exactly** as in the references — same spelling, same capitalization, same letterforms. If you cannot render it **character-for-character** faithfully, **do not** invent a replacement word: instead show **plain wood grain** in that spot, or a **soft, unreadable** impression with **no legible fake letters**.
-- Do NOT use the bundle/catalog name, SKU notes, or marketing copy to “fill in” or rewrite a logo. Logos and printed text may come **only** from what is clearly visible in the reference images.
-- Do NOT add new watermarks, corner bugs, or slogan text that are not in the references.
-- Add QToys logo to the image, blue text, bottom right corner.
-- Add QSAFE, smaller text, top right corner.
-`;
+const MULTI_PRODUCT_BLOCK = `Multi-product composition:
+- Include every referenced product once, clearly visible.
+- Keep one coherent scene and realistic shadows.
+- Do not place products on tables covered by cloth/blankets.
+- Avoid dominant furniture; product must be the focus.
+- Preserve relative size across products.`;
 
-const MULTI_PRODUCT_BLOCK = `Multi-product bundle (references are ordered per SKU: natural folder photos first, then that SKU’s blank-background studio image when provided; repeat for each product in the bundle):
-- Include EVERY distinct product from the references in the final image. Do not omit any product, hide one behind another without intent, or shrink one to an unreadable speck.
-- Integrate all items into ONE coherent photograph: same ground plane (table, floor, or mat), one lighting setup, consistent perspective. Each object must sit on that surface with believable contact shadows — no “pasted” or floating cutouts, no arbitrary mismatched scale between products.
-- Relative size (critical): keep the products’ sizes **in proportion to each other** as implied by the reference images taken together. If the references show product A clearly larger than product B, the final scene must not reverse that or make one item a tiny speck next to a huge one unless the references collectively justify that relationship. Do not randomly rescale products for composition in a way that contradicts their real relative sizes.
-- Do not let one product dominate while others look like separate overlays. Give each referenced product clear, intentional presence in the composition.
-- Avoid broken physics: no intersecting solid wood parts, no duplicated rings in impossible stacks, no hands or limbs clipping through products unless interaction is simple and physically plausible. Prefer a clean product-led shot over a busy scene with bad geometry.
-- Each product’s existing printed branding (if any in the refs) must stay consistent — no swapped or invented logo text between products.
-- When references include both lifestyle/natural photos and blank-background studio shots of the same products, treat each pair as the same physical items; use the studio shots to lock scale and identity.`;
+const SINGLE_PRODUCT_BLOCK = `Single-product lifestyle:
+- Show one product only, centered and prominent.
+- Use a clean, minimal scene with no tablecloth/blanket surfaces.
+- Keep background warm-neutral and simple (no busy props).`;
 
-const STYLE_BLOCK = `Style: professional e-commerce lifestyle shot, high-end soft lighting, neutral minimalist background, no busy clutter.
-- For small printed branding on products: preserve it from the references only; never hallucinate alternate spellings. Prefer compositions where tiny logos stay natural and readable **only** if copied faithfully from the refs — otherwise keep that area visually simple (wood grain, no fake type).`;
+const STYLE_BLOCK = `Style:
+- Reference-first product photography.
+- Clean e-commerce framing; no clutter, no decorative tables.
+- Do not reuse the exact same surface/background style for every variation.
+- If uncertain, choose fidelity over creativity.`;
 
-const ISOLATED_SINGLE_BLOCK = `Blank-background product isolation:
+/**
+ * Always appended for lifestyle prompts (even when users override the main prompt text),
+ * so core style/identity lock never disappears.
+ */
+const STYLE_LOCK_BLOCK = `Style lock (non-negotiable):
+- Treat the reference photos as the style source of truth. Match their lighting character, color tone/white balance, contrast, texture realism, lens feel, and framing style.
+- Do NOT restyle into a different visual genre (cartoon, CGI/plastic look, heavy HDR, over-smoothed, painterly, glossy ad look) if that is not present in the references.
+- Keep wood grain/material finish faithful to references (no artificial color shifts, no fake varnish sheen, no random saturation boost).
+- If uncertain between creativity and fidelity, choose fidelity to references.`;
+
+const ISOLATED_SINGLE_BLOCK = `Cream-background product isolation:
 - Show ONLY the single real product from the reference images below, alone, as a clean studio product shot.
-- Background must be a **plain, empty, near-pure white** (~#FFFFFF to #F7F7F7), completely clear of props, surfaces, environment, text, labels, or other products.
+- Background must be a plain warm cream tone (~#F7F1E3 to #EFE6D6), with no props/surfaces/text.
 - No other SKUs, no additional items — strictly a single-product cutout-style image with soft, realistic contact shadow directly under the product only.
 - Preserve the product’s shape, color, materials, and proportions exactly as in the references. Do not invent details or variants.
 - Centered, front-facing or the reference’s most representative angle. Fill a reasonable portion of the frame with comfortable margins.`;
@@ -66,6 +69,12 @@ const ISOLATED_BUNDLE_BLOCK = `Blank-background full-bundle lineup:
 export type ReferenceImage = {
   mimeType: string;
   data: Buffer;
+};
+
+export type RuntimeRenderSettings = {
+  addMetalNameTag: boolean;
+  addQsafeIcon: boolean;
+  qsafeIconUrl: string | null;
 };
 
 function getClient(): GoogleGenAI {
@@ -132,11 +141,37 @@ function includeDescriptionInImagePrompt(): boolean {
   return process.env.GEMINI_IMAGE_PROMPT_INCLUDE_DESCRIPTION === "true";
 }
 
+function keepFirstChars(s: string | null | undefined, maxChars: number): string | null {
+  if (!s) return null;
+  const trimmed = s.trim();
+  if (!trimmed) return null;
+  if (maxChars <= 0 || trimmed.length <= maxChars) return trimmed;
+  return `${trimmed.slice(0, maxChars).trim()}\n...(truncated)`;
+}
+
+function maxCharsFor(name: string, fallback: number): number {
+  const raw = process.env[name];
+  const n = Number.parseInt(raw ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 function defaultImageTemperature(): number {
   const raw = process.env.GEMINI_IMAGE_TEMPERATURE;
-  if (raw === undefined || raw === "") return 0.45;
+  if (raw === undefined || raw === "") return 0.25;
   const n = Number.parseFloat(raw);
-  return Number.isFinite(n) ? Math.min(2, Math.max(0, n)) : 0.45;
+  return Number.isFinite(n) ? Math.min(2, Math.max(0, n)) : 0.25;
+}
+
+function includeSkuDimensionsInPrompt(): boolean {
+  return process.env.GEMINI_INCLUDE_SKU_DIMENSIONS !== "false";
+}
+
+function includeLessonsInPrompt(): boolean {
+  return process.env.GEMINI_INCLUDE_LESSONS !== "false";
+}
+
+function includeGlobalRulesInPrompt(): boolean {
+  return process.env.GEMINI_INCLUDE_GLOBAL_RULES !== "false";
 }
 
 /** Optional global hint for stores with one primary brand (e.g. QToys). Reduces wrong spellings on stamps when refs are ambiguous. */
@@ -218,11 +253,20 @@ function buildPrompt(params: {
     const custom = params.lifestylePromptPrefixOverride?.trim();
     if (custom) {
       lines.push(custom);
+      lines.push("");
+      lines.push(STYLE_LOCK_BLOCK);
+      lines.push("");
+      lines.push(
+        `Variation direction: ${params.variationLabel ?? "primary composition"}. Keep product identity and realism, but allow meaningful environment variation (surface/background/framing) instead of near-duplicate shots.`,
+      );
     } else {
       lines.push(FIDELITY_BLOCK);
       lines.push("");
       if (params.productCount !== undefined && params.productCount > 1) {
         lines.push(MULTI_PRODUCT_BLOCK);
+        lines.push("");
+      } else {
+        lines.push(SINGLE_PRODUCT_BLOCK);
         lines.push("");
       }
 
@@ -244,6 +288,8 @@ function buildPrompt(params: {
       }
 
       lines.push(STYLE_BLOCK);
+      lines.push("");
+      lines.push(STYLE_LOCK_BLOCK);
       const brandHint = brandLogoHintBlock();
       if (brandHint) {
         lines.push("");
@@ -251,7 +297,7 @@ function buildPrompt(params: {
       }
       lines.push("");
       lines.push(
-        `Shot variation: ${params.variationLabel ?? "primary composition"}. Keep the same products as above; change camera angle, framing, or light direction only — still no unrelated objects.`,
+        `Shot variation: ${params.variationLabel ?? "primary composition"}. Keep the same products, but vary scene setup naturally. At least one variation should avoid a plain tabletop look (e.g. playroom floor, shelf, rug, or toy-room corner).`,
       );
     }
   } else if (params.kind === "isolated-single") {
@@ -284,25 +330,47 @@ function buildPrompt(params: {
     }
   }
 
-  if (params.skuNotesBlock?.trim()) {
+  const boundedNotes = keepFirstChars(
+    params.skuNotesBlock,
+    maxCharsFor("GEMINI_MAX_SKU_NOTES_CHARS", 1200),
+  );
+  if (boundedNotes) {
     lines.push("");
-    lines.push(params.skuNotesBlock.trim());
+    lines.push(boundedNotes);
   }
 
-  if (params.skuDimensionsBlock?.trim()) {
+  const boundedDimensions = includeSkuDimensionsInPrompt()
+    ? keepFirstChars(
+        params.skuDimensionsBlock,
+        maxCharsFor("GEMINI_MAX_DIMENSIONS_CHARS", 800),
+      )
+    : null;
+  if (boundedDimensions) {
     lines.push("");
-    lines.push(params.skuDimensionsBlock.trim());
+    lines.push(boundedDimensions);
   }
 
-  if (params.lessonsBlock?.trim()) {
+  const boundedLessons = includeLessonsInPrompt()
+    ? keepFirstChars(
+        params.lessonsBlock,
+        maxCharsFor("GEMINI_MAX_LESSONS_CHARS", 1200),
+      )
+    : null;
+  if (boundedLessons) {
     lines.push("");
-    lines.push(params.lessonsBlock.trim());
+    lines.push(boundedLessons);
   }
 
-  if (params.globalRulesBlock?.trim()) {
+  const boundedRules = includeGlobalRulesInPrompt()
+    ? keepFirstChars(
+        params.globalRulesBlock,
+        maxCharsFor("GEMINI_MAX_GLOBAL_RULES_CHARS", 1200),
+      )
+    : null;
+  if (boundedRules) {
     lines.push("");
     lines.push("User-defined generation rules (apply to this run):");
-    lines.push(params.globalRulesBlock.trim());
+    lines.push(boundedRules);
   }
 
   return lines.join("\n");
@@ -368,6 +436,72 @@ async function runImageGeneration(
   return { buffer: Buffer.from(b64, "base64"), mimeType: "image/png" };
 }
 
+const qsafeIconCache = new Map<string, Buffer>();
+
+async function fetchQsafeIcon(url: string): Promise<Buffer | null> {
+  const cached = qsafeIconCache.get(url);
+  if (cached) return cached;
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 8000);
+  try {
+    const res = await fetch(url, { signal: ac.signal });
+    if (!res.ok) return null;
+    const arr = await res.arrayBuffer();
+    const buf = Buffer.from(arr);
+    if (buf.length === 0) return null;
+    qsafeIconCache.set(url, buf);
+    return buf;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function applyBundleDecorations(
+  image: GeneratedImage,
+  productCount: number | undefined,
+  renderSettings: RuntimeRenderSettings | null | undefined,
+): Promise<GeneratedImage> {
+  if (!renderSettings) return image;
+  const base = sharp(image.buffer);
+  const meta = await base.metadata();
+  const width = meta.width ?? 0;
+  const height = meta.height ?? 0;
+  if (width < 16 || height < 16) return image;
+
+  const overlays: sharp.OverlayOptions[] = [];
+  const margin = Math.max(12, Math.round(width * 0.02));
+
+  if (
+    renderSettings.addQsafeIcon &&
+    productCount !== undefined &&
+    productCount > 1 &&
+    renderSettings.qsafeIconUrl
+  ) {
+    const icon = await fetchQsafeIcon(renderSettings.qsafeIconUrl);
+    if (icon) {
+      const maxW = Math.max(24, Math.round(width * 0.19));
+      const maxH = Math.max(24, Math.round(height * 0.29));
+      const iconBuf = await sharp(icon)
+        .resize({ width: maxW, height: maxH, fit: "inside", withoutEnlargement: true })
+        .png()
+        .toBuffer();
+      const iconMeta = await sharp(iconBuf).metadata();
+      const w = iconMeta.width ?? maxW;
+      overlays.push({
+        input: iconBuf,
+        left: Math.max(0, width - w - margin),
+        top: margin,
+      });
+    }
+  }
+
+  if (overlays.length === 0) return image;
+  const out = await base.composite(overlays).png().toBuffer();
+  return { buffer: out, mimeType: "image/png" };
+}
+
 /** Lifestyle composite of the whole bundle. */
 export async function generateBundleImage(params: {
   references: ReferenceImage[];
@@ -383,6 +517,7 @@ export async function generateBundleImage(params: {
   globalRulesBlock?: string | null;
   /** Full lifestyle prefix from UI / data/bundle-lifestyle-prefix.json (optional). */
   lifestylePromptPrefixOverride?: string | null;
+  renderSettings?: RuntimeRenderSettings | null;
 }): Promise<GeneratedImage> {
   const ai = getClient();
   const textPrompt = buildPrompt({
@@ -397,7 +532,17 @@ export async function generateBundleImage(params: {
     globalRulesBlock: params.globalRulesBlock,
     lifestylePromptPrefixOverride: params.lifestylePromptPrefixOverride,
   });
-  return runImageGeneration(ai, textPrompt, params.references, params.seed);
+  const generated = await runImageGeneration(
+    ai,
+    textPrompt,
+    params.references,
+    params.seed,
+  );
+  return applyBundleDecorations(
+    generated,
+    params.productCount,
+    params.renderSettings,
+  );
 }
 
 /** Isolated blank-background image of a single SKU. */

@@ -83,10 +83,8 @@ function pushBundle(
   description: string | null,
   tokens: string[],
 ) {
-  if (tokens.length < 2) {
-    errors.push(
-      `Line ${lineIndex + 1}: need at least two SKUs (master + one component).`,
-    );
+  if (tokens.length < 1) {
+    errors.push(`Line ${lineIndex + 1}: need at least one SKU.`);
     return;
   }
   bundles.push({
@@ -161,6 +159,31 @@ function parseCsvBundles(
   const nameI = findCol(headers, "name", "bundle name", "bundle_name");
   const skuI = findCol(headers, "sku", "skus");
   const descI = findCol(headers, "description", "desc", "notes", "details");
+  const headerCount = headers.length;
+  // #region agent log
+  fetch("http://127.0.0.1:7707/ingest/72fe3a30-af19-4b80-9c22-4286b44eed04", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Debug-Session-Id": "b7e4fb",
+    },
+    body: JSON.stringify({
+      sessionId: "b7e4fb",
+      runId: "pre-fix",
+      hypothesisId: "H5",
+      location: "lib/parseSkus.ts:162",
+      message: "CSV header detection",
+      data: {
+        headerCount,
+        headers,
+        nameI,
+        skuI,
+        descI,
+      },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
 
   if (nameI < 0 || skuI < 0) {
     errors.push(
@@ -168,8 +191,6 @@ function parseCsvBundles(
     );
     return { bundles, errors };
   }
-
-  const headerCount = headers.length;
 
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
@@ -185,9 +206,60 @@ function parseCsvBundles(
 
     if (!skuVal) {
       errors.push(`CSV row ${r + 1}: SKU column is empty.`);
+      // #region agent log
+      fetch("http://127.0.0.1:7707/ingest/72fe3a30-af19-4b80-9c22-4286b44eed04", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Debug-Session-Id": "b7e4fb",
+        },
+        body: JSON.stringify({
+          sessionId: "b7e4fb",
+          runId: "pre-fix",
+          hypothesisId: "H5",
+          location: "lib/parseSkus.ts:187",
+          message: "CSV row has empty SKU column",
+          data: {
+            rowIndex1Based: r + 1,
+            rowLength: row.length,
+            row,
+            nameVal,
+            skuVal,
+            descVal,
+          },
+          timestamp: Date.now(),
+        }),
+      }).catch(() => {});
+      // #endregion
       continue;
     }
     const tokens = parseSkuTokens(skuVal);
+    // #region agent log
+    fetch("http://127.0.0.1:7707/ingest/72fe3a30-af19-4b80-9c22-4286b44eed04", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Debug-Session-Id": "b7e4fb",
+      },
+      body: JSON.stringify({
+        sessionId: "b7e4fb",
+        runId: "pre-fix",
+        hypothesisId: "H5",
+        location: "lib/parseSkus.ts:213",
+        message: "CSV row parsed into bundle fields",
+        data: {
+          rowIndex1Based: r + 1,
+          rowLength: row.length,
+          row,
+          nameVal,
+          skuVal,
+          descVal,
+          tokens,
+        },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
     pushBundle(bundles, errors, r, nameVal || null, descVal || null, tokens);
   }
 
@@ -262,7 +334,8 @@ function parsePlainLines(
 /**
  * Accepts:
  * - CSV with headers including **name** and **SKU** (optional **description**).
- * - Plain text: one bundle per line — either `SKUs only`, or `Name: SKU1 SKU2` / `Name | SKU1 SKU2`.
+ * - Plain text: one entry per line — either `SKUs only`, or `Name: SKU1 SKU2` / `Name | SKU1 SKU2`.
+ * - Single SKU entries are allowed (`Name | SKU1` or `SKU1`).
  */
 export function parseBundleInput(raw: string): {
   bundles: ParsedBundle[];
@@ -276,10 +349,54 @@ export function parseBundleInput(raw: string): {
 
   const firstLine = trimmed.split(/\r?\n/u)[0] ?? "";
   if (looksLikeNameSkuCsv(firstLine)) {
+    // #region agent log
+    fetch("http://127.0.0.1:7707/ingest/72fe3a30-af19-4b80-9c22-4286b44eed04", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Debug-Session-Id": "b7e4fb",
+      },
+      body: JSON.stringify({
+        sessionId: "b7e4fb",
+        runId: "pre-fix",
+        hypothesisId: "H6",
+        location: "lib/parseSkus.ts:317",
+        message: "input format selected csv",
+        data: {
+          firstLine,
+          totalChars: trimmed.length,
+          totalLines: trimmed.split(/\r?\n/u).length,
+        },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
     const { bundles, errors } = parseCsvBundles(trimmed);
     return { bundles, errors, format: "csv" };
   }
 
+  // #region agent log
+  fetch("http://127.0.0.1:7707/ingest/72fe3a30-af19-4b80-9c22-4286b44eed04", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Debug-Session-Id": "b7e4fb",
+    },
+    body: JSON.stringify({
+      sessionId: "b7e4fb",
+      runId: "pre-fix",
+      hypothesisId: "H6",
+      location: "lib/parseSkus.ts:338",
+      message: "input format selected plain",
+      data: {
+        firstLine,
+        totalChars: trimmed.length,
+        totalLines: trimmed.split(/\r?\n/u).length,
+      },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
   const { bundles, errors } = parsePlainLines(trimmed);
   return { bundles, errors, format: "plain" };
 }

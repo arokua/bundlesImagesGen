@@ -5,11 +5,18 @@ import { dedupeDuplicateOutputFolders, getDriveClient } from "@/lib/drive";
 export const maxDuration = 120;
 
 export async function POST(request: Request) {
+  const requestId = crypto.randomUUID();
+  const json = (body: unknown, status = 200) =>
+    NextResponse.json(body, {
+      status,
+      headers: { "x-request-id": requestId },
+    });
+
   let body: { outputFolderId?: string };
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+    return json({ error: "Invalid JSON body." }, 400);
   }
 
   const outputFolderId =
@@ -18,12 +25,12 @@ export async function POST(request: Request) {
     "";
 
   if (!outputFolderId) {
-    return NextResponse.json(
+    return json(
       {
         error:
           "Set outputFolderId in the request body or OUTPUT_FOLDER_ID in the environment.",
       },
-      { status: 400 },
+      400,
     );
   }
 
@@ -32,10 +39,10 @@ export async function POST(request: Request) {
     auth = await getDriveAuth();
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Drive auth failed.";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return json({ error: msg }, 500);
   }
 
   const drive = await getDriveClient(auth);
   const outputDedupe = await dedupeDuplicateOutputFolders(drive, outputFolderId);
-  return NextResponse.json(outputDedupe);
+  return json(outputDedupe);
 }

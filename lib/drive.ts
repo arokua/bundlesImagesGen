@@ -147,8 +147,15 @@ export function resolveFolderForSku(
 
 const IMAGE_MIME_PREFIX = "image/";
 
-function isImageMime(mime?: string | null): boolean {
-  return !!mime && mime.startsWith(IMAGE_MIME_PREFIX);
+/**
+ * Subset of Drive `image/*` types accepted as Gemini inline reference parts.
+ * Photoshop PSD is `image/x-photoshop` on Drive but Gemini returns INVALID_ARGUMENT for it.
+ */
+function isGeminiInlineReferenceMime(mime?: string | null): boolean {
+  if (!mime || !mime.startsWith(IMAGE_MIME_PREFIX)) return false;
+  const m = mime.toLowerCase();
+  if (m === "image/x-photoshop" || m === "image/vnd.adobe.photoshop") return false;
+  return true;
 }
 
 export async function listImageFilesInFolder(
@@ -162,14 +169,14 @@ export async function listImageFilesInFolder(
   do {
     const res = await drive.files.list({
       q,
-      fields: "nextPageToken, files(id, name, mimeType)",
+      fields: "nextPageToken, files(id, name, mimeType, size)",
       pageSize: 1000,
       pageToken,
       supportsAllDrives: true,
       includeItemsFromAllDrives: true,
     });
     for (const f of res.data.files ?? []) {
-      if (isImageMime(f.mimeType)) out.push(f);
+      if (isGeminiInlineReferenceMime(f.mimeType)) out.push(f);
     }
     pageToken = res.data.nextPageToken ?? undefined;
   } while (pageToken);
