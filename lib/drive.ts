@@ -106,6 +106,23 @@ export function findAllFoldersForSku(
 }
 
 /**
+ * Resolve SKU folders by checking each parent group in order until one has matches.
+ * May return **multiple** folders when several names match (e.g. duplicate product lines).
+ */
+export function resolveAllFoldersForSkuInParents(
+  childFolderGroups: ChildFolder[][],
+  sku: string,
+): ChildFolder[] {
+  for (const children of childFolderGroups) {
+    const matches = findAllFoldersForSku(children, sku);
+    if (matches.length > 0) return matches;
+  }
+  throw new Error(
+    `No folder under any configured parent whose name starts with SKU "${sku}" (first token must equal the SKU; numeric SKUs cannot be followed by another digit-only token).`,
+  );
+}
+
+/**
  * Resolve SKU folders under the primary parent’s children first; if none, under backup.
  * May return **multiple** folders when several names match (e.g. duplicate product lines).
  */
@@ -114,14 +131,9 @@ export function resolveAllFoldersForSku(
   backupChildren: ChildFolder[] | null,
   sku: string,
 ): ChildFolder[] {
-  const primary = findAllFoldersForSku(primaryChildren, sku);
-  if (primary.length > 0) return primary;
-  if (backupChildren) {
-    const backup = findAllFoldersForSku(backupChildren, sku);
-    if (backup.length > 0) return backup;
-  }
-  throw new Error(
-    `No folder under primary (or backup) parent whose name starts with SKU "${sku}" (first token must equal the SKU; numeric SKUs cannot be followed by another digit-only token).`,
+  return resolveAllFoldersForSkuInParents(
+    backupChildren ? [primaryChildren, backupChildren] : [primaryChildren],
+    sku,
   );
 }
 

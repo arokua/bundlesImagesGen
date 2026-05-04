@@ -1,0 +1,5 @@
+## Change Log
+
+- 2026-04-28: Added ordered multi-parent Drive SKU lookup so the app can search the main parent plus up to three configured backup parents. Changed `lib/drive.ts` lines 108-138, `lib/driveParentFolders.ts` lines 1-31, `app/api/bundle/route.ts` lines 1-120, `app/api/bundle/preview/route.ts` lines 1-116, and `app/api/bundle/drive-folders-config/route.ts` lines 36-57 so preview/full runs resolve SKU folders across `PARENT_FOLDER_FALLBACK_ID`, `PARENT_FOLDER_BACKUP_2_ID`, and `PARENT_FOLDER_BACKUP_3_ID` in order.
+- 2026-04-28: Added folder-level reference targeting so when one SKU matches multiple Drive folders, each folder can be enabled/disabled independently while still choosing photos inside enabled folders. Changed `lib/bundlePipeline.ts` lines 159-181, 204-303, 323-404, 406-474, and 793-824 plus `app/page.tsx` lines 44-49, 175-280, 1949-1981, 2027-2200, 2202-2367, and 2428-2539 to carry `{ enabled, indexes }` selections from the UI to the preview/generation pipeline.
+- 2026-04-28: Documented the extra backup folder env vars in `.env.example` lines 12-18 so the third backup folder can be configured without code changes later.

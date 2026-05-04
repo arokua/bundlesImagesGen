@@ -427,6 +427,13 @@ async function runImageGeneration(
     }),
   );
 
+  // Measure and log the token usage for this exact request
+  if (response.usageMetadata) {
+    console.log(`[Token Usage - ${modelId()}] Prompt: ${response.usageMetadata.promptTokenCount} | Candidates: ${response.usageMetadata.candidatesTokenCount} | Total: ${response.usageMetadata.totalTokenCount}`);
+  } else {
+    console.log(`[Token Usage - ${modelId()}] No usage metadata returned by API.`);
+  }
+
   const b64 = response.data;
   if (!b64) {
     throw new Error(

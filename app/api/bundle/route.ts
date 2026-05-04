@@ -1,15 +1,11 @@
 import { NextResponse } from "next/server";
 import { getDriveAuth } from "@/lib/driveAuth";
 import { getDriveClient, listChildFolders } from "@/lib/drive";
+import { resolveSearchParentIds } from "@/lib/driveParentFolders";
 import { processOneBundle, type BundleResult } from "@/lib/bundlePipeline";
 import { parseBundleInput } from "@/lib/parseSkus";
 
 export const maxDuration = 300;
-
-/** Default Drive parent used when a SKU folder is missing under the request’s primary parent. */
-const PARENT_FOLDER_FALLBACK_ID =
-  process.env.PARENT_FOLDER_FALLBACK_ID?.trim() ||
-  "1JJ9RC7rDbbMN3jryfpquem0Xu9DEppMy";
 
 type NdjsonEvent =
   | {
@@ -38,6 +34,7 @@ export async function POST(request: Request) {
   let body: {
     text?: string;
     parentFolderId?: string;
+    backupParentFolderIds?: string[];
     outputFolderId?: string;
     stream?: boolean;
   };
@@ -81,13 +78,13 @@ export async function POST(request: Request) {
   }
 
   const drive = await getDriveClient(auth);
-  const primaryChildFolders = await listChildFolders(drive, parentFolderId);
-  const useFallbackParent =
-    PARENT_FOLDER_FALLBACK_ID.length > 0 &&
-    PARENT_FOLDER_FALLBACK_ID !== parentFolderId;
-  const fallbackChildFolders = useFallbackParent
-    ? await listChildFolders(drive, PARENT_FOLDER_FALLBACK_ID)
-    : null;
+  const searchParentIds = resolveSearchParentIds(
+    parentFolderId,
+    body.backupParentFolderIds,
+  );
+  const childFolderGroups = await Promise.all(
+    searchParentIds.map((folderId) => listChildFolders(drive, folderId)),
+  );
 
   const wantStream = body.stream === true;
 
@@ -117,8 +114,7 @@ export async function POST(request: Request) {
             const result = await processOneBundle(
               drive,
               bundle,
-              primaryChildFolders,
-              fallbackChildFolders,
+              childFolderGroups,
               outputFolderId,
             );
             send({ type: "result", result });
@@ -149,8 +145,7 @@ export async function POST(request: Request) {
       await processOneBundle(
         drive,
         bundle,
-        primaryChildFolders,
-        fallbackChildFolders,
+        childFolderGroups,
         outputFolderId,
       ),
     );

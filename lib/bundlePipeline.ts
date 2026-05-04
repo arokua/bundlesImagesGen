@@ -4,7 +4,7 @@ import {
   createSubfolder,
   downloadFileBuffer,
   listImageFilesInFolder,
-  resolveAllFoldersForSku,
+  resolveAllFoldersForSkuInParents,
   uploadBufferAsFile,
   type ChildFolder,
 } from "@/lib/drive";
@@ -161,14 +161,39 @@ type CollectRefOptions = {
   refsOnlyForceAll?: boolean;
 };
 
-export type RefSelectionMap = Record<string, number | number[]>;
+type RefSelectionValue =
+  | number
+  | number[]
+  | {
+      enabled?: boolean;
+      indexes?: number | number[];
+    };
 
-function normalizeSelectedIndexes(
-  raw: number | number[] | undefined,
+export type RefSelectionMap = Record<string, RefSelectionValue>;
+
+type NormalizedRefSelection = {
+  enabled: boolean;
+  indexes: number[];
+};
+
+function normalizeRefSelection(
+  raw: RefSelectionValue | undefined,
   maxExclusive: number,
-): number[] {
-  if (maxExclusive <= 0) return [];
-  const arr = Array.isArray(raw) ? raw : raw === undefined ? [0] : [raw];
+): NormalizedRefSelection {
+  const enabled =
+    typeof raw === "object" && raw !== null && !Array.isArray(raw)
+      ? raw.enabled !== false
+      : true;
+  if (!enabled || maxExclusive <= 0) return { enabled, indexes: [] };
+  const indexesRaw =
+    typeof raw === "object" && raw !== null && !Array.isArray(raw)
+      ? raw.indexes
+      : raw;
+  const arr = Array.isArray(indexesRaw)
+    ? indexesRaw
+    : indexesRaw === undefined
+      ? [0]
+      : [indexesRaw];
   const unique = new Set<number>();
   for (const v of arr) {
     const n = Number.parseInt(String(v), 10);
@@ -176,8 +201,8 @@ function normalizeSelectedIndexes(
     const clamped = Math.min(Math.max(0, n), maxExclusive - 1);
     unique.add(clamped);
   }
-  if (unique.size === 0) return [0];
-  return [...unique].sort((a, b) => a - b);
+  if (unique.size === 0) return { enabled: true, indexes: [0] };
+  return { enabled: true, indexes: [...unique].sort((a, b) => a - b) };
 }
 
 function fileByteSize(file: drive_v3.Schema$File): number {
@@ -204,8 +229,7 @@ function pickLightestFromDesc(
 async function collectRefImagesBySku(
   drive: drive_v3.Drive,
   bundle: ParsedBundle,
-  primaryChildFolders: ChildFolder[],
-  fallbackChildFolders: ChildFolder[] | null,
+  childFolderGroups: ChildFolder[][],
   refSelection?: RefSelectionMap,
   options?: CollectRefOptions,
 ): Promise<{
@@ -224,11 +248,7 @@ async function collectRefImagesBySku(
     : MAX_PREVIEW_IMAGES_PER_FOLDER;
 
   for (const sku of skus) {
-    let folders = resolveAllFoldersForSku(
-      primaryChildFolders,
-      fallbackChildFolders,
-      sku,
-    );
+    let folders = resolveAllFoldersForSkuInParents(childFolderGroups, sku);
     folders = [...folders].sort((a, b) =>
       a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
     );
@@ -263,7 +283,12 @@ async function collectRefImagesBySku(
           `No downloadable image files in folder "${folder.name}" for SKU "${sku}".`,
         );
       }
-      const picks = normalizeSelectedIndexes(refSelection?.[folderId], fromThisFolder.length);
+      const selection = normalizeRefSelection(
+        refSelection?.[folderId],
+        fromThisFolder.length,
+      );
+      if (!selection.enabled) continue;
+      const picks = selection.indexes;
       for (const pick of picks) {
         list.push(fromThisFolder[pick]!);
         const pickedMeta = slice[pick];
@@ -323,8 +348,7 @@ function refsOnlyProxyUrl(fileId: string): string {
 async function collectRefMetaBySku(
   drive: drive_v3.Drive,
   bundle: ParsedBundle,
-  primaryChildFolders: ChildFolder[],
-  fallbackChildFolders: ChildFolder[] | null,
+  childFolderGroups: ChildFolder[][],
   refSelection?: RefSelectionMap,
   forceAll?: boolean,
 ): Promise<{
@@ -347,11 +371,7 @@ async function collectRefMetaBySku(
   const maxPerFolder = forceAll ? Number.MAX_SAFE_INTEGER : MAX_REFS_ONLY_IMAGES_PER_FOLDER;
 
   for (const sku of skus) {
-    let folders = resolveAllFoldersForSku(
-      primaryChildFolders,
-      fallbackChildFolders,
-      sku,
-    );
+    let folders = resolveAllFoldersForSkuInParents(childFolderGroups, sku);
     folders = [...folders].sort((a, b) =>
       a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
     );
@@ -377,7 +397,9 @@ async function collectRefMetaBySku(
         }));
       if (refs.length === 0) continue;
 
-      const picks = normalizeSelectedIndexes(refSelection?.[folderId], refs.length);
+      const selection = normalizeRefSelection(refSelection?.[folderId], refs.length);
+      if (!selection.enabled) continue;
+      const picks = selection.indexes;
       for (const pick of picks) {
         const pickedMeta = picked[pick];
         if (pickedMeta?.id) {
@@ -406,8 +428,7 @@ async function collectRefMetaBySku(
 export async function collectBundleRefsOnly(
   drive: drive_v3.Drive,
   bundle: ParsedBundle,
-  primaryChildFolders: ChildFolder[],
-  fallbackChildFolders: ChildFolder[] | null,
+  childFolderGroups: ChildFolder[][],
   refSelection?: RefSelectionMap,
   refsOnlyForceAll?: boolean,
 ): Promise<
@@ -420,8 +441,7 @@ export async function collectBundleRefsOnly(
     const { folderSources, referenceSourceFiles } = await collectRefMetaBySku(
       drive,
       bundle,
-      primaryChildFolders,
-      fallbackChildFolders,
+      childFolderGroups,
       refSelection,
       refsOnlyForceAll,
     );
@@ -452,8 +472,7 @@ export async function collectBundleRefsOnly(
 export async function generateBundlePreview(
   drive: drive_v3.Drive,
   bundle: ParsedBundle,
-  primaryChildFolders: ChildFolder[],
-  fallbackChildFolders: ChildFolder[] | null,
+  childFolderGroups: ChildFolder[][],
   seedOffset: number,
   refSelection?: RefSelectionMap,
 ): Promise<
@@ -468,8 +487,7 @@ export async function generateBundlePreview(
       await collectRefImagesBySku(
         drive,
         bundle,
-        primaryChildFolders,
-        fallbackChildFolders,
+        childFolderGroups,
         refSelection,
       );
 
@@ -793,16 +811,14 @@ export async function commitBundleToDrive(
 export async function processOneBundle(
   drive: drive_v3.Drive,
   bundle: ParsedBundle,
-  primaryChildFolders: ChildFolder[],
-  fallbackChildFolders: ChildFolder[] | null,
+  childFolderGroups: ChildFolder[][],
   outputFolderId: string,
 ): Promise<BundleResult> {
   const lineIndex = bundle.lineIndex;
   const preview = await generateBundlePreview(
     drive,
     bundle,
-    primaryChildFolders,
-    fallbackChildFolders,
+    childFolderGroups,
     0,
   );
   if (!preview.ok) {

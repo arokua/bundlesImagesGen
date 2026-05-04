@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getDriveAuth } from "@/lib/driveAuth";
 import { getDriveClient, listChildFolders } from "@/lib/drive";
+import { resolveSearchParentIds } from "@/lib/driveParentFolders";
 import {
   collectBundleRefsOnly,
   generateBundlePreview,
@@ -10,10 +11,6 @@ import { parseBundleInput } from "@/lib/parseSkus";
 import { createPreviewSession } from "@/lib/previewImageStore";
 
 export const maxDuration = 300;
-
-const PARENT_FOLDER_FALLBACK_ID =
-  process.env.PARENT_FOLDER_FALLBACK_ID?.trim() ||
-  "1JJ9RC7rDbbMN3jryfpquem0Xu9DEppMy";
 
 export async function POST(request: Request) {
   const requestId = crypto.randomUUID();
@@ -26,6 +23,7 @@ export async function POST(request: Request) {
   let body: {
     text?: string;
     parentFolderId?: string;
+    backupParentFolderIds?: string[];
     lineIndex?: number;
     seedOffset?: number;
     refSelection?: RefSelectionMap;
@@ -89,13 +87,13 @@ export async function POST(request: Request) {
   }
 
   const drive = await getDriveClient(auth);
-  const primaryChildFolders = await listChildFolders(drive, parentFolderId);
-  const useFallbackParent =
-    PARENT_FOLDER_FALLBACK_ID.length > 0 &&
-    PARENT_FOLDER_FALLBACK_ID !== parentFolderId;
-  const fallbackChildFolders = useFallbackParent
-    ? await listChildFolders(drive, PARENT_FOLDER_FALLBACK_ID)
-    : null;
+  const searchParentIds = resolveSearchParentIds(
+    parentFolderId,
+    body.backupParentFolderIds,
+  );
+  const childFolderGroups = await Promise.all(
+    searchParentIds.map((folderId) => listChildFolders(drive, folderId)),
+  );
 
   const refSelection = body.refSelection;
   const refSel =
@@ -107,8 +105,7 @@ export async function POST(request: Request) {
     const refsResult = await collectBundleRefsOnly(
       drive,
       bundle,
-      primaryChildFolders,
-      fallbackChildFolders,
+      childFolderGroups,
       refSel,
       body.refsOnlyForceAll === true,
     );
@@ -133,8 +130,7 @@ export async function POST(request: Request) {
   const result = await generateBundlePreview(
     drive,
     bundle,
-    primaryChildFolders,
-    fallbackChildFolders,
+    childFolderGroups,
     seedOffset,
     refSel,
   );

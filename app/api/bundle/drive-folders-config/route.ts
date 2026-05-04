@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getDriveAuth } from "@/lib/driveAuth";
 import { getDriveClient } from "@/lib/drive";
 import { driveFolderUrl } from "@/lib/driveLinks";
+import { getConfiguredBackupParentIds } from "@/lib/driveParentFolders";
 
 export const maxDuration = 15;
 
@@ -37,6 +38,7 @@ export async function GET() {
   const requestId = crypto.randomUUID();
   const parentFolderId = process.env.PARENT_FOLDER_ID?.trim() || "";
   const outputFolderId = process.env.OUTPUT_FOLDER_ID?.trim() || "";
+  const backupParentFolderIds = getConfiguredBackupParentIds(parentFolderId);
 
   const [parent, output] = await Promise.all([
     resolveFolder(parentFolderId || undefined),
@@ -47,6 +49,7 @@ export async function GET() {
     {
       defaults: {
         parentFolderId: parentFolderId || null,
+        backupParentFolderIds,
         outputFolderId: outputFolderId || null,
       },
       resolved: {

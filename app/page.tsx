@@ -41,7 +41,13 @@ type ImagePayload = {
   url?: string;
 };
 
-type RefSelectionMap = Record<string, number[]>;
+type RefSelectionMap = Record<
+  string,
+  {
+    enabled: boolean;
+    indexes: number[];
+  }
+>;
 type RenderSettings = {
   addQsafeIcon: boolean;
   qsafeIconUrl: string | null;
@@ -175,6 +181,7 @@ async function readJsonSafe<T>(
 export default function Home() {
   const [text, setText] = useState("");
   const [parentFolderId, setParentFolderId] = useState("");
+  const [backupParentFolderIds, setBackupParentFolderIds] = useState<string[]>([]);
   const [outputFolderId, setOutputFolderId] = useState("");
   const [driveFolderHints, setDriveFolderHints] = useState<{
     parent: { id: string; name: string | null; url: string } | null;
@@ -230,6 +237,7 @@ export default function Home() {
         const data = await readJsonSafe<{
           defaults?: {
             parentFolderId?: string | null;
+            backupParentFolderIds?: string[] | null;
             outputFolderId?: string | null;
           };
           resolved?: {
@@ -250,14 +258,28 @@ export default function Home() {
           output: data.resolved?.output ?? null,
         });
         const dp = data.defaults?.parentFolderId?.trim();
+        const db = Array.isArray(data.defaults?.backupParentFolderIds)
+          ? data.defaults.backupParentFolderIds
+              .map((v) => String(v ?? "").trim())
+              .filter(Boolean)
+          : [];
         const dout = data.defaults?.outputFolderId?.trim();
         setParentFolderId((prev) => prev.trim() || dp || "");
+        setBackupParentFolderIds(db);
         setOutputFolderId((prev) => prev.trim() || dout || "");
       } catch {
         /* ignore */
       }
     })();
   }, []);
+
+  function driveSearchPayload() {
+    return {
+      parentFolderId: parentFolderId || undefined,
+      backupParentFolderIds:
+        backupParentFolderIds.length > 0 ? backupParentFolderIds : undefined,
+    };
+  }
 
   useEffect(() => {
     void (async () => {
@@ -342,7 +364,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           text,
-          parentFolderId: parentFolderId || undefined,
+          ...driveSearchPayload(),
           outputFolderId: outputFolderId || undefined,
           stream: true,
         }),
@@ -498,7 +520,7 @@ export default function Home() {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   text,
-                  parentFolderId: parentFolderId || undefined,
+                  ...driveSearchPayload(),
                   lineIndex: bundle.lineIndex,
                   seedOffset: 0,
                   refsOnly: true,
@@ -589,7 +611,7 @@ export default function Home() {
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({
                     text,
-                    parentFolderId: parentFolderId || undefined,
+                    ...driveSearchPayload(),
                     lineIndex: bundle.lineIndex,
                     seedOffset: 0,
                     refsOnly: true,
@@ -710,7 +732,7 @@ export default function Home() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               text,
-              parentFolderId: parentFolderId || undefined,
+              ...driveSearchPayload(),
               lineIndex: bundle.lineIndex,
               seedOffset,
               refSelection: refSelectionForRequest,
@@ -855,7 +877,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           text,
-          parentFolderId: parentFolderId || undefined,
+          ...driveSearchPayload(),
           lineIndex,
           seedOffset,
           refSelection,
@@ -1339,6 +1361,13 @@ export default function Home() {
             <p className="text-xs text-zinc-500">
               Folder that holds each product’s photos (one folder per product code).
             </p>
+            {backupParentFolderIds.length > 0 && (
+              <p className="text-xs text-zinc-500">
+                Also searches {backupParentFolderIds.length} backup folder
+                {backupParentFolderIds.length === 1 ? "" : "s"} from config if a SKU
+                is not found here.
+              </p>
+            )}
             <input
               id="parent"
               className="w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
@@ -1951,7 +1980,7 @@ function initRefSelFromRefs(p: {
 }): RefSelectionMap {
   const m: RefSelectionMap = {};
   for (const rf of p.referenceFolders) {
-    m[rf.folderId] = [0];
+    m[rf.folderId] = { enabled: true, indexes: [0] };
   }
   return m;
 }
@@ -2030,6 +2059,7 @@ function SkuReferenceCard({
   folders,
   selectedRefIndexesByFolderId,
   onSelectFolderRef,
+  onToggleFolder,
 }: {
   sku: string;
   initialNote: string;
@@ -2040,6 +2070,7 @@ function SkuReferenceCard({
     imageIndex: number,
     checked: boolean,
   ) => void;
+  onToggleFolder: (folderId: string, enabled: boolean) => void;
 }) {
   const [note, setNote] = useState(initialNote);
   const [baseline, setBaseline] = useState(initialNote);
@@ -2148,18 +2179,35 @@ function SkuReferenceCard({
               key={`${rf.folderId}-${rf.sku}`}
               className="rounded border border-zinc-200 bg-white p-2 dark:border-zinc-700 dark:bg-zinc-900/60"
             >
-              <p className="break-words text-[11px] text-zinc-700 dark:text-zinc-300">
-                Folder: {rf.folderName}
-              </p>
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <p className="break-words text-[11px] text-zinc-700 dark:text-zinc-300">
+                  Folder: {rf.folderName}
+                </p>
+                <label className="inline-flex items-center gap-2 text-[11px] text-zinc-600 dark:text-zinc-300">
+                  <input
+                    type="checkbox"
+                    checked={selectedRefIndexesByFolderId[rf.folderId]?.enabled ?? true}
+                    onChange={(e) => onToggleFolder(rf.folderId, e.target.checked)}
+                  />
+                  Use this folder
+                </label>
+              </div>
               <p className="mt-1 text-[10px] text-zinc-500">
-                Select one or more photos. Selected photos are used for generation
-                and copied into the output folder.
+                Turn folders on or off, then select one or more photos from each enabled
+                folder. Selected photos are used for generation and copied into the output
+                folder.
               </p>
-              <div className="mt-2 flex flex-wrap gap-2">
+              <div
+                className={`mt-2 flex flex-wrap gap-2 ${
+                  selectedRefIndexesByFolderId[rf.folderId]?.enabled === false
+                    ? "pointer-events-none opacity-45"
+                    : ""
+                }`}
+              >
                 {rf.images.map((img, ii) => {
                   const selected =
-                    selectedRefIndexesByFolderId[rf.folderId]?.includes(ii) ??
-                    false;
+                    (selectedRefIndexesByFolderId[rf.folderId]?.enabled ?? true) &&
+                    (selectedRefIndexesByFolderId[rf.folderId]?.indexes ?? []).includes(ii);
                   return (
                     <label
                       key={`${rf.folderId}-${ii}`}
@@ -2285,15 +2333,41 @@ function ReferenceGateModal({
                             [folderId]: (() => {
                               const cur =
                                 prev[it.lineIndex]?.[folderId] ??
-                                initRefSelFromRefs(it.refs)[folderId] ??
-                                [];
+                                initRefSelFromRefs(it.refs)[folderId] ?? {
+                                  enabled: true,
+                                  indexes: [0],
+                                };
+                              const currentIndexes = cur.indexes ?? [0];
                               if (checked) {
-                                const next = [...cur, imageIndex];
-                                return [...new Set(next)].sort((a, b) => a - b);
+                                const next = [...currentIndexes, imageIndex];
+                                return {
+                                  enabled: cur.enabled !== false,
+                                  indexes: [...new Set(next)].sort((a, b) => a - b),
+                                };
                               }
-                              const next = cur.filter((x) => x !== imageIndex);
-                              return next.length > 0 ? next : [cur[0] ?? imageIndex];
+                              const next = currentIndexes.filter((x) => x !== imageIndex);
+                              return {
+                                enabled: cur.enabled !== false,
+                                indexes:
+                                  next.length > 0 ? next : [currentIndexes[0] ?? imageIndex],
+                              };
                             })(),
+                          },
+                        }))
+                      }
+                      onToggleFolder={(folderId, enabled) =>
+                        setSelByLine((prev) => ({
+                          ...prev,
+                          [it.lineIndex]: {
+                            ...(prev[it.lineIndex] ?? initRefSelFromRefs(it.refs)),
+                            [folderId]: {
+                              ...(prev[it.lineIndex]?.[folderId] ??
+                                initRefSelFromRefs(it.refs)[folderId] ?? {
+                                  enabled: true,
+                                  indexes: [0],
+                                }),
+                              enabled,
+                            },
                           },
                         }))
                       }
@@ -2440,21 +2514,37 @@ function ReviewModal({ state }: { state: ReviewModalState }) {
                   selectedRefIndexesByFolderId={refSel}
                   onSelectFolderRef={(folderId, imageIndex, checked) =>
                     setRefSel((prev) => {
-                      const cur = prev[folderId] ?? [0];
+                      const cur = prev[folderId] ?? { enabled: true, indexes: [0] };
+                      const currentIndexes = cur.indexes ?? [0];
                       if (checked) {
                         return {
                           ...prev,
-                          [folderId]: [...new Set([...cur, imageIndex])].sort(
-                            (a, b) => a - b,
-                          ),
+                          [folderId]: {
+                            enabled: cur.enabled !== false,
+                            indexes: [...new Set([...currentIndexes, imageIndex])].sort(
+                              (a, b) => a - b,
+                            ),
+                          },
                         };
                       }
-                      const next = cur.filter((x) => x !== imageIndex);
+                      const next = currentIndexes.filter((x) => x !== imageIndex);
                       return {
                         ...prev,
-                        [folderId]: next.length > 0 ? next : [cur[0] ?? imageIndex],
+                        [folderId]: {
+                          enabled: cur.enabled !== false,
+                          indexes: next.length > 0 ? next : [currentIndexes[0] ?? imageIndex],
+                        },
                       };
                     })
+                  }
+                  onToggleFolder={(folderId, enabled) =>
+                    setRefSel((prev) => ({
+                      ...prev,
+                      [folderId]: {
+                        ...(prev[folderId] ?? { enabled: true, indexes: [0] }),
+                        enabled,
+                      },
+                    }))
                   }
                 />
               );
