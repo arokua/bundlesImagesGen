@@ -20,6 +20,25 @@ This project demonstrates:
 - environment-based configuration for local/dev/production use
 - fallback and error handling for missing folders, missing images, duplicate SKU folders, and generation failures
 - public-safe configuration using `.env.example` and excluded credentials
+## System design overview
+
+```mermaid
+flowchart LR
+    A[CSV or text bundle input] --> B[Parse bundle rows]
+    B --> C[Extract bundle name, master SKU, and component SKUs]
+    C --> D[Resolve matching SKU folders in Google Drive]
+    D --> E[Retrieve candidate product images]
+    E --> F[Render reference images in the UI]
+    F --> G[User selects reference images]
+    G --> H[User optionally adds image-specific comments]
+    H --> I[Build Gemini generation request]
+    I --> J[Generate bundle images]
+    J --> K[Upload outputs to Google Drive]
+    K --> L[Review generated images]
+    L --> M{Accept result?}
+    M -- Rerun --> G
+    M -- Commit --> N[Keep final bundle output]
+```
 ## 1. Mục đích
 
 Công cụ này dành cho team cần tạo ảnh bundle từ nhiều sản phẩm có sẵn ảnh trong Google Drive.
