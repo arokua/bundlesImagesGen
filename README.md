@@ -7,7 +7,19 @@
 - ghép nhiều SKU thành 1 ảnh bundle bằng Gemini
 - upload ảnh kết quả lên thư mục output trên Google Drive
 - dọn các thư mục output bị trùng tên khi cần
+## Engineering highlights
 
+This project demonstrates:
+
+- API integration with Google Drive and Gemini image generation
+- batch processing for multiple product bundles
+- parsing semi-structured CSV/text input into structured bundle records
+- reference-image selection logic using SKU-based Drive folder matching
+- round-robin image selection to improve product coverage
+- streamed NDJSON progress updates for long-running generation jobs
+- environment-based configuration for local/dev/production use
+- fallback and error handling for missing folders, missing images, duplicate SKU folders, and generation failures
+- public-safe configuration using `.env.example` and excluded credentials
 ## 1. Mục đích
 
 Công cụ này dành cho team cần tạo ảnh bundle từ nhiều sản phẩm có sẵn ảnh trong Google Drive.
